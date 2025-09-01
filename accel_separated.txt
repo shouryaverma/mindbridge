@@ -11,25 +11,24 @@ accelerate launch --num_processes=$((1 * 1)) \
 --mixed_precision=fp16 train_shared_backbone.py \
 --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
 --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
---model_name=shared_smallmodel_Trn4sVal1s \
+--model_name=shared_smallmodel_Trn4sVal1s_withBlurryRecon \
 --batch_size=3 \
---num_epochs=5 \
+--num_epochs=8 \
 --num_sessions=4 \
 --val_sessions=1 \
 --hidden_dim=64 \
 --n_blocks=2 \
 --use_prior \
 --prior_scale=30 \
---no-blurry_recon \
+--blurry_recon \
 --clip_scale=1 \
 --max_lr=3e-4 \
 --mixup_pct=0.33 \
---no-use_image_aug \
 --ckpt_saving \
 --ckpt_interval=2 \
 --wandb_log \
---wandb_project='mindbridge-pretraining'
+--wandb_project='mindbridge-pretraining
 
-# --no-wandb_log 
+--no-wandb_log
 
-# --train_subjects=2 5 7 \
+--train_subjects=2 5 7 \

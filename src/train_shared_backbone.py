@@ -198,7 +198,8 @@ def main():
     # --- Model Initialization ---
     accelerator.print("\n--- Initializing Models ---")
 
-    local_clip_path = '/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache/CLIP_L/open_clip_pytorch_model.bin'
+    local_vae_path = f'{args.cache_dir}/sd-vae-ft-mse'
+    local_clip_path = f'{args.cache_dir}/CLIP_L/open_clip_pytorch_model.bin'
 
     # CLIP Image Encoder
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
@@ -235,7 +236,7 @@ def main():
     if args.blurry_recon:
         from autoencoder.convnext import ConvnextXL
         
-        autoenc = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
+        autoenc = AutoencoderKL.from_pretrained(local_vae_path).to(device)
         autoenc.eval().requires_grad_(False)
         
         cnx = ConvnextXL(f'{args.cache_dir}/convnext_xlarge_alpha0.75_fullckpt.pth').to(device)
