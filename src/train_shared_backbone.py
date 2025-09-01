@@ -462,6 +462,33 @@ def main():
                 "val/bwd_acc": val_bwd_acc,
                 "lr": lr_scheduler.get_last_lr()[0]
             }
+
+            # add individual loss componants
+            if args.use_prior:
+                logs["train/prior_loss"] = loss_prior.item()
+                logs["train/prior_loss_scaled"] = (args.prior_scale * loss_prior).item()
+
+            logs["train/clip_loss"] = loss_clip.item()
+            logs["train/clip_loss_scaled"] = (args.clip_scale * loss_clip).item()
+
+            if args.blurry_recon:
+                logs["train/blur_loss"] = loss_blurry.item()
+                logs["train/blur_loss_scaled"] = (args.blur_scale * loss_blurry).item()
+
+            # Validation metrics
+            logs.update({
+                "val/clip_loss": val_loss,
+                "val/fwd_acc": val_fwd_acc,
+                "val/bwd_acc": val_bwd_acc,
+            })
+
+            # Log loss ratios for monitoring balance
+            if args.use_prior:
+                logs["train/prior_ratio"] = (args.prior_scale * loss_prior / total_loss).item()
+            logs["train/clip_ratio"] = (args.clip_scale * loss_clip / total_loss).item()
+            if args.blurry_recon:
+                logs["train/blur_ratio"] = (args.blur_scale * loss_blurry / total_loss).item()
+            
             progress_bar.set_postfix(**logs)
             if args.wandb_log:
                 wandb.log(logs)
