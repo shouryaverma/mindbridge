@@ -412,11 +412,16 @@ def main():
                 for s_idx, s in enumerate(args.train_subjects):
                     val_dl_iter = iter(val_dls_prepared[s_idx])
                     
-                    # Sample a few batches for validation
-                    for val_batch_idx in range(min(10, len(val_dls_prepared[s_idx]))):  # Limit to 10 batches per subject
+                    # Sample a fixed number of batches for validation
+                    max_val_batches = 10  # Limit validation batches per subject
+                    val_batch_count = 0
+                    
+                    while val_batch_count < max_val_batches:
                         try:
                             val_behav, _, _, _ = next(val_dl_iter)
+                            val_batch_count += 1
                         except StopIteration:
+                            # No more batches available for this subject
                             break
                             
                         # Process validation batch

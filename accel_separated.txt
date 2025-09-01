@@ -5,7 +5,7 @@ sinteractive -A pccr -p ai -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=12
 
 
 
-# shared backbone smallmodel 2 sessions
+# shared backbone smallmodel 4 sessions wandb-logged
 accelerate launch --num_processes=$((1 * 1)) \
 --num_machines=1 \
 --mixed_precision=fp16 train_shared_backbone.py \
@@ -13,7 +13,7 @@ accelerate launch --num_processes=$((1 * 1)) \
 --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
 --model_name=shared_smallmodel_Trn4sVal1s \
 --batch_size=3 \
---num_epochs=2 \
+--num_epochs=5 \
 --num_sessions=4 \
 --val_sessions=1 \
 --hidden_dim=64 \
@@ -30,4 +30,6 @@ accelerate launch --num_processes=$((1 * 1)) \
 --wandb_log \
 --wandb_project='mindbridge-pretraining'
 
---train_subjects=2 5 7 \
+# --no-wandb_log 
+
+# --train_subjects=2 5 7 \
