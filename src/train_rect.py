@@ -194,18 +194,18 @@ def main():
     
     def my_split_by_node(urls): return urls
     
-    num_samples_per_epoch = (750 * args.num_sessions) // num_devices # if not args.multi_subject else (750 * 40) // num_devices
+    num_samples_per_epoch = (750 * args.num_sessions) // num_devices if not args.multi_subject else (750 * 40) // num_devices
     train_batch_size = batch_size // len(subj_list)
     num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(subj_list))
 
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
     train_data, train_dl, voxels, num_voxels, num_voxels_list = {}, {}, {}, {}, []
-    # nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30]) # Subj 0 is a placeholder
+    nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30]) # Subj 0 is a placeholder
     
     for s in subj_list:
         if args.multi_subject:
-            train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
+            train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
         else:
             train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
 
