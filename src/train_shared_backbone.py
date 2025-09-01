@@ -457,9 +457,6 @@ def main():
             logs = {
                 "epoch": epoch,
                 "train/loss": epoch_loss / num_batches if num_batches > 0 else 0,
-                "val/loss": val_loss,
-                "val/fwd_acc": val_fwd_acc,
-                "val/bwd_acc": val_bwd_acc,
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
