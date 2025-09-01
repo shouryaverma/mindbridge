@@ -114,7 +114,7 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="mindeye_v2_model", help="Name for saving checkpoints and logging.")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the MindEye V2 dataset.")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="Directory for storing cached models (e.g., VAE).")
-    parser.add_argument("--subj", type=int, default=1, choices=[1, 2, 5, 7], help="Subject ID to train on.")
+    parser.add_argument("--subj", type=int, default=1, choices=[1, 2, 5, 7], help="Subject ID to train on (for fine-tuning).")
     parser.add_argument("--num_epochs", type=int, default=150, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=16, help="Per-device batch size.")
 
@@ -194,18 +194,18 @@ def main():
     
     def my_split_by_node(urls): return urls
     
-    num_samples_per_epoch = (750 * args.num_sessions) // num_devices if not args.multi_subject else (750 * 40) // num_devices
+    num_samples_per_epoch = (750 * args.num_sessions) // num_devices # if not args.multi_subject else (750 * 40) // num_devices
     train_batch_size = batch_size // len(subj_list)
     num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(subj_list))
 
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
     train_data, train_dl, voxels, num_voxels, num_voxels_list = {}, {}, {}, {}, []
-    nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30]) # Subj 0 is a placeholder
-
+    # nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30]) # Subj 0 is a placeholder
+    
     for s in subj_list:
         if args.multi_subject:
-            train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
+            train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
         else:
             train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
 
@@ -223,6 +223,13 @@ def main():
         num_voxels[f'subj0{s}'] = betas.shape[1]
         voxels[f'subj0{s}'] = betas
         accelerator.print(f"Loaded training data and {num_voxels[f'subj0{s}']} voxels for subj0{s}")
+    
+    # Load validation subject's voxel data if not already loaded (for multi-subject case)
+    if args.multi_subject and f'subj0{args.subj}' not in voxels:
+        with h5py.File(f'{args.data_path}/betas_all_subj0{args.subj}_fp32_renorm.hdf5', 'r') as f:
+            betas = torch.from_numpy(f['betas'][:]).to("cpu").to(torch.float16)
+        voxels[f'subj0{args.subj}'] = betas
+        accelerator.print(f"Loaded validation voxel data: {betas.shape[1]} voxels for subj0{args.subj}")
 
     # Validation dataloader (only for the specified subject)
     test_url = f"{args.data_path}/wds/subj0{args.subj}/"
@@ -250,16 +257,36 @@ def main():
     # --- Model Initialization ---
     accelerator.print("\n--- Initializing Models ---")
 
+    local_clip_path = '/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache/CLIP_L/open_clip_pytorch_model.bin'
+
     # CLIP Image Encoder
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
-        arch="ViT-bigG-14", version="laion2b_s39b_b160k", output_tokens=True, only_tokens=True
+        arch="ViT-L-14", 
+        version=local_clip_path, 
+        output_tokens=True, 
+        only_tokens=True
     ).to(device)
     clip_seq_dim = 256
-    clip_emb_dim = 1664
+    clip_emb_dim = 1024
 
     # Main MindEye model
     model = MindEyeModule()
-    model.ridge = RidgeRegression(num_voxels_list, out_features=args.hidden_dim)
+
+    if args.multi_subject:
+        # Include validation subject in ridge regression if not in training subjects
+        all_voxel_counts = num_voxels_list.copy()  # Training subjects
+        if args.subj not in subj_list:  # Add validation subject if not in training
+            val_voxel_count = voxels[f'subj0{args.subj}'].shape[1]
+            all_voxel_counts.append(val_voxel_count)
+        model.ridge = RidgeRegression(all_voxel_counts, out_features=args.hidden_dim)
+        # Create subject-to-ridge mapping
+        subj_to_ridge_idx = {subj_list[i]: i for i in range(len(subj_list))}
+        if args.subj not in subj_list:
+            subj_to_ridge_idx[args.subj] = len(subj_list)  # Validation subject gets last index
+    else:
+        model.ridge = RidgeRegression(num_voxels_list, out_features=args.hidden_dim)
+        subj_to_ridge_idx = {args.subj: 0}  # Single subject case
+
     model.backbone = BrainNetwork(
         h=args.hidden_dim, in_dim=args.hidden_dim, seq_len=1, n_blocks=args.n_blocks,
         clip_size=clip_emb_dim, out_dim=clip_emb_dim * clip_seq_dim,
@@ -269,7 +296,7 @@ def main():
     # Rectified Flow Prior model
     if args.use_prior:
         prior_network = PriorNetwork(
-            dim=clip_emb_dim, depth=6, dim_head=52, heads=clip_emb_dim // 52,
+            dim=clip_emb_dim, depth=6, dim_head=64, heads=clip_emb_dim // 64,
             causal=False, num_tokens=clip_seq_dim, learned_query_mode="pos_emb"
         )
         model.rectified_flow = BrainRectifiedFlow(
@@ -372,6 +399,7 @@ def main():
         
         # --- Pre-load all batches for the epoch for speed ---
         voxel_iters, perm_iters, betas_iters, select_iters = {}, {}, {}, {}
+        skipped_iterations = set()
         image_iters = torch.zeros(num_iterations_per_epoch, global_batch_size, 3, 224, 224, dtype=torch.float16)
 
         for s_idx, s in enumerate(subj_list):
@@ -382,7 +410,9 @@ def main():
                 # Image data
                 img_indices = behav[:,0,0].cpu().long().numpy()
                 unique_indices, sorted_idx = np.unique(img_indices, return_index=True)
-                if len(unique_indices) != len(img_indices): continue
+                if len(unique_indices) != len(img_indices): 
+                    skipped_iterations.add(i)
+                    continue
                 
                 image_batch = torch.from_numpy(images[unique_indices]).to(torch.float16)
                 image_iters[i, s_idx*train_batch_size:(s_idx+1)*train_batch_size] = image_batch
@@ -401,6 +431,8 @@ def main():
 
         # --- Train on pre-loaded batches ---
         for i in range(num_iterations_per_epoch):
+            if i in skipped_iterations: # <-- FIX: Add this line
+                continue
             optimizer.zero_grad()
             
             # Collate data from all subjects for the current iteration
@@ -462,7 +494,7 @@ def main():
         # --- End of Epoch Evaluation ---
         if accelerator.is_main_process:
             model.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
                 # Prepare test data by averaging 3 repeats of the same image
                 if test_image is None:
                     test_behav = next(iter(test_dl))[0]
@@ -482,7 +514,7 @@ def main():
                 
                 # Evaluate on a subset for speed
                 eval_indices = torch.arange(len(test_voxel))[:300]
-                voxel_eval = test_voxel[eval_indices]
+                voxel_eval = test_voxel[eval_indices].to(next(model.parameters()).dtype)
                 image_eval = test_image[eval_indices].to(torch.float16)
                 
                 clip_target_eval = clip_img_embedder(image_eval)
@@ -490,8 +522,10 @@ def main():
                 # Average voxel embeddings over 3 repeats
                 clip_voxels_avg = 0
                 for rep in range(3):
-                    voxel_ridge_eval = model.module.ridge(voxel_eval[:, rep], 0) # Subj index is 0 if not multi-subject fine-tuning
-                    _, clip_voxels_eval, _ = model.module.backbone(voxel_ridge_eval)
+                    voxel_ridge_eval = accelerator.unwrap_model(model).ridge(voxel_eval[:, rep], 0) # Subj index is 0 if not multi-subject fine-tuning
+                    # ridge_idx = subj_to_ridge_idx[args.subj]  # Use correct ridge index for validation subject
+                    # voxel_ridge_eval = accelerator.unwrap_model(model).ridge(voxel_eval[:, rep], ridge_idx)
+                    _, clip_voxels_eval, _ = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
                     clip_voxels_avg += clip_voxels_eval
                 clip_voxels_avg /= 3
                 
@@ -504,6 +538,8 @@ def main():
                 test_fwd_pct_correct = utils.topk(sims, labels, k=1).item()
                 test_bwd_pct_correct = utils.topk(sims.T, labels, k=1).item()
 
+                # Ensure both tensors have the same dtype
+                
                 eval_loss_clip = utils.soft_clip_loss(clip_voxels_norm_eval, clip_target_norm_eval, temp=0.006)
             
             logs = {
