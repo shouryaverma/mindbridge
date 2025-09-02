@@ -222,7 +222,7 @@ def main():
         .decode("torch") \
         .rename(behav="behav.npy") \
         .to_tuple("behav")
-    test_dl = torch.utils.data.DataLoader(test_data, batch_size=num_test, shuffle=False, drop_last=True)
+    test_dl = torch.utils.data.DataLoader(test_data, batch_size=num_test, shuffle=False, drop_last=True, pin_memory=True)
     accelerator.print(f"Loaded validation data with {num_test} samples.")
     
     # Load all 73k COCO images
@@ -233,8 +233,9 @@ def main():
     # --- Model Initialization ---
     accelerator.print("\n--- Initializing Models ---")
 
-    local_clip_path = '/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache/CLIP_L/open_clip_pytorch_model.bin'
-
+    local_vae_path = f'{args.cache_dir}/sd-vae-ft-mse'
+    local_clip_path = f'{args.cache_dir}/CLIP_L/open_clip_pytorch_model.bin'
+    
     # CLIP Image Encoder
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
         arch="ViT-L-14", 
@@ -275,7 +276,7 @@ def main():
     if args.blurry_recon:
         from autoencoder.convnext import ConvnextXL
         
-        autoenc = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
+        autoenc = AutoencoderKL.from_pretrained(local_vae_path).to(device)
         autoenc.eval().requires_grad_(False)
         
         cnx = ConvnextXL(f'{args.cache_dir}/convnext_xlarge_alpha0.75_fullckpt.pth').to(device)
@@ -483,11 +484,35 @@ def main():
             logs = {
                 "epoch": epoch,
                 "train/loss": epoch_loss / num_batches if num_batches > 0 else 0,
-                "val/fwd_acc": test_fwd_pct_correct,
-                "val/bwd_acc": test_bwd_pct_correct,
-                "val/clip_loss": eval_loss_clip.item(),
                 "lr": lr_scheduler.get_last_lr()[0]
             }
+
+            # Add individual loss components (same as shared backbone)
+            if args.use_prior:
+                logs["train/prior_loss"] = loss_prior.item()
+                logs["train/prior_loss_scaled"] = (args.prior_scale * loss_prior).item()
+
+            logs["train/clip_loss"] = loss_clip.item()
+            logs["train/clip_loss_scaled"] = (args.clip_scale * loss_clip).item()
+
+            if args.blurry_recon:
+                logs["train/blur_loss"] = loss_blurry.item()
+                logs["train/blur_loss_scaled"] = (args.blur_scale * loss_blurry).item()
+
+            # Validation metrics
+            logs.update({
+                "val/clip_loss": eval_loss_clip.item(),
+                "val/fwd_acc": test_fwd_pct_correct,
+                "val/bwd_acc": test_bwd_pct_correct,
+            })
+
+            # Log loss ratios for monitoring balance
+            if args.use_prior:
+                logs["train/prior_ratio"] = (args.prior_scale * loss_prior / total_loss).item()
+            logs["train/clip_ratio"] = (args.clip_scale * loss_clip / total_loss).item()
+            if args.blurry_recon:
+                logs["train/blur_ratio"] = (args.blur_scale * loss_blurry / total_loss).item()
+
             progress_bar.set_postfix(**logs)
             if args.wandb_log:
                 wandb.log(logs)
