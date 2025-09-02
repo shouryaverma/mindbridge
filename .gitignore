@@ -2,6 +2,7 @@ wandb/
 train_logs/
 slurms/
 datasets/
+src/cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
