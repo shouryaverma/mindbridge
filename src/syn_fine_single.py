@@ -39,7 +39,7 @@ except ImportError:
 
 # Local module imports
 import utils
-from models_rect import BrainNetwork, PriorNetwork, BrainRectifiedFlow
+from syn_model_rect import BrainNetwork, PriorNetwork, BrainRectifiedFlow
 
 # Enable TF32 for faster matmul operations on supported hardware
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -353,7 +353,11 @@ def main():
     
     for epoch in progress_bar:
         model.train()
-        
+
+        epoch_prior_loss = 0
+        epoch_clip_loss = 0  
+        epoch_blur_loss = 0
+
         # --- Pre-load all batches for the epoch for speed ---
         voxel_iters, perm_iters, betas_iters, select_iters = {}, {}, {}, {}
         skipped_iterations = set()
@@ -449,6 +453,11 @@ def main():
                 lr_scheduler.step()
                 
                 epoch_loss += total_loss.item()
+                if args.use_prior:
+                    epoch_prior_loss += loss_prior.item()
+                epoch_clip_loss += loss_clip.item()
+                if args.blurry_recon:
+                    epoch_blur_loss += loss_blurry.item()
                 num_batches += 1
         
         # --- End of Epoch Evaluation ---
@@ -478,6 +487,10 @@ def main():
                 image_eval = test_image[eval_indices].to(torch.float16)
                 
                 clip_target_eval = clip_img_embedder(image_eval)
+
+                val_total_loss = 0
+                val_prior_loss = 0
+                val_blur_loss = 0
                 
                 # Average voxel embeddings over 3 repeats
                 clip_voxels_avg = 0
@@ -497,6 +510,35 @@ def main():
                 test_bwd_pct_correct = utils.topk(sims.T, labels, k=1).item()
                 
                 eval_loss_clip = utils.soft_clip_loss(clip_voxels_norm_eval, clip_target_norm_eval, temp=0.006)
+                val_total_loss += (args.clip_scale * eval_loss_clip).item()
+                
+                # Add validation prior loss
+                if args.use_prior:
+                    backbone_features_eval, _, _ = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
+                    val_loss_prior, _ = accelerator.unwrap_model(model).rectified_flow(text_embed=backbone_features_eval, image_embed=clip_target_eval)
+                    val_prior_loss = val_loss_prior.item()
+                    val_total_loss += (args.prior_scale * val_loss_prior).item()
+
+                    # Test rectified flow generation quality
+                    generated_embeddings = accelerator.unwrap_model(model).rectified_flow.sample(
+                        text_embed=backbone_features_eval[:10], 
+                        num_steps=20
+                    )
+                    val_gen_similarity = torch.nn.functional.cosine_similarity(
+                        generated_embeddings.flatten(1), 
+                        clip_target_eval[:10].flatten(1), 
+                        dim=-1
+                    ).mean().item()
+                
+                # Add validation blur loss  
+                if args.blurry_recon:
+                    _, _, val_blurry_image_enc = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
+                    val_image_enc_pred, _ = val_blurry_image_enc
+                    with torch.no_grad():
+                        val_image_enc = autoenc.encode(2 * image_eval - 1).latent_dist.mode() * 0.18215
+                    val_loss_blur = l1(val_image_enc_pred, val_image_enc)
+                    val_blur_loss = val_loss_blur.item()
+                    val_total_loss += (args.blur_scale * val_loss_blur).item()
             
             logs = {
                 "epoch": epoch,
@@ -504,24 +546,36 @@ def main():
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
-            # Add individual loss components (same as shared backbone)
+            # Add individual loss components (epoch averages)
             if args.use_prior:
-                logs["train/prior_loss"] = loss_prior.item()
-                logs["train/prior_loss_scaled"] = (args.prior_scale * loss_prior).item()
+                logs["train/prior_loss"] = epoch_prior_loss / num_batches if num_batches > 0 else 0
+                logs["train/prior_loss_scaled"] = (args.prior_scale * epoch_prior_loss / num_batches) if num_batches > 0 else 0
 
-            logs["train/clip_loss"] = loss_clip.item()
-            logs["train/clip_loss_scaled"] = (args.clip_scale * loss_clip).item()
+            logs["train/clip_loss"] = epoch_clip_loss / num_batches if num_batches > 0 else 0
+            logs["train/clip_loss_scaled"] = (args.clip_scale * epoch_clip_loss / num_batches) if num_batches > 0 else 0
 
             if args.blurry_recon:
-                logs["train/blur_loss"] = loss_blurry.item()
-                logs["train/blur_loss_scaled"] = (args.blur_scale * loss_blurry).item()
+                logs["train/blur_loss"] = epoch_blur_loss / num_batches if num_batches > 0 else 0
+                logs["train/blur_loss_scaled"] = (args.blur_scale * epoch_blur_loss / num_batches) if num_batches > 0 else 0
 
             # Validation metrics
             logs.update({
+                "val/total_loss": val_total_loss,
                 "val/clip_loss": eval_loss_clip.item(),
                 "val/fwd_acc": test_fwd_pct_correct,
                 "val/bwd_acc": test_bwd_pct_correct,
             })
+            
+            if args.use_prior:
+                logs["val/prior_loss"] = val_prior_loss
+            if args.blurry_recon:
+                logs["val/blur_loss"] = val_blur_loss
+
+            if args.use_prior:
+                logs["val/prior_loss"] = val_prior_loss
+                logs["val/prior_generation_similarity"] = val_gen_similarity
+            if args.blurry_recon:
+                logs["val/blur_loss"] = val_blur_loss
 
             # Log loss ratios for monitoring balance
             if args.use_prior:

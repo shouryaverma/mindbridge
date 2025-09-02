@@ -239,7 +239,7 @@ class BrainRectifiedFlow(nn.Module):
     """
     def __init__(self,
                  net,                          # This will be the PriorNetwork instance
-                 image_embed_dim=1664,
+                 image_embed_dim=1024,
                  condition_on_text_encodings=False, # Kept for PriorNetwork compatibility
                  text_cond_drop_prob=0.2,      # For classifier-free guidance
                  voxel2clip=None):
@@ -253,7 +253,7 @@ class BrainRectifiedFlow(nn.Module):
     @torch.no_grad()
     def sample(self,
                text_embed,
-               num_steps=100,
+               num_steps=20,
                cond_scale=1.):
         """
         Generates an image embedding by solving the ODE from noise to data.

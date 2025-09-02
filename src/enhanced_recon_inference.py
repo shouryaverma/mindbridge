@@ -1,4 +1,9 @@
-# %%
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
 import os
 import sys
 import json
@@ -37,7 +42,10 @@ accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
 device = accelerator.device
 print("device:",device)
 
-# %%
+
+# In[2]:
+
+
 # if running this interactively, can specify jupyter_args here for argparser to use
 if utils.is_interactive():
     model_name = "final_subj01_pretrained_40sess_24bs"
@@ -48,13 +56,16 @@ if utils.is_interactive():
     jupyter_args = f"--model_name={model_name} --subj=1"
     print(jupyter_args)
     jupyter_args = jupyter_args.split()
-    
-    from IPython.display import clear_output # function to clear print outputs in cell
-    %load_ext autoreload 
-    # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions
-    %autoreload 2 
 
-# %%
+    from IPython.display import clear_output # function to clear print outputs in cell
+    get_ipython().run_line_magic('load_ext', 'autoreload')
+    # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions
+    get_ipython().run_line_magic('autoreload', '2')
+
+
+# In[28]:
+
+
 parser = argparse.ArgumentParser(description="Model Training Configuration")
 parser.add_argument(
     "--model_name", type=str, default="testing",
@@ -75,7 +86,7 @@ else:
 # create global variables without the args prefix
 for attribute_name in vars(args).keys():
     globals()[attribute_name] = getattr(args, attribute_name)
-    
+
 # seed all random functions
 utils.seed_everything(seed)
 
@@ -97,7 +108,10 @@ all_blurryrecons = transforms.Resize((768,768))(all_blurryrecons).float()
 print(model_name)
 print(all_images.shape, all_recons.shape, all_clipvoxels.shape, all_blurryrecons.shape, all_predcaptions.shape)
 
-# %%
+
+# In[29]:
+
+
 config = OmegaConf.load("generative_models/configs/unclip6.yaml")
 config = OmegaConf.to_container(config, resolve=True)
 unclip_params = config["model"]["params"]
@@ -164,7 +178,10 @@ vector_uc = out["vector"].to(device)
 print("crossattn_uc", crossattn_uc.shape)
 print("vector_uc", vector_uc.shape)
 
-# %%
+
+# In[30]:
+
+
 if utils.is_interactive(): plotting=True
 
 num_samples = 1 # PS: I tried increasing this to 16 and picking highest cosine similarity like we did in MindEye1, it didnt seem to increase eval performance!
@@ -181,14 +198,17 @@ if plotting or num_samples>1:
     )
     clip_img_embedder.to(device)
 
-# %%
+
+# In[31]:
+
+
 all_enhancedrecons = None
 for img_idx in tqdm(range(len(all_recons))):
     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16), base_engine.ema_scope():
         base_engine.sampler.num_steps = 25
-        
+
         image = all_recons[[img_idx]]
-        
+
         if plotting:
             print("blur pixcorr:",utils.pixcorr(all_blurryrecons[[img_idx]].float(), all_images[[img_idx]].float()))
             print("blur cossim:",nn.functional.cosine_similarity(clip_img_embedder(utils.resize(all_blurryrecons[[img_idx]].float(),256).to(device)).flatten(1), 
@@ -197,7 +217,7 @@ for img_idx in tqdm(range(len(all_recons))):
             print("recon pixcorr:",utils.pixcorr(image,all_images[[img_idx]].float()))
             print("recon cossim:",nn.functional.cosine_similarity(clip_img_embedder(utils.resize(image,224).to(device)).flatten(1), 
                                                          clip_img_embedder(utils.resize(all_images[[img_idx]].float(),224).to(device)).flatten(1)))
-        
+
         image = image.to(device)
         prompt = all_predcaptions[[img_idx]][0]
         # prompt = ""
@@ -265,7 +285,7 @@ for img_idx in tqdm(range(len(all_recons))):
             all_enhancedrecons = samples
         else:
             all_enhancedrecons = torch.vstack((all_enhancedrecons, samples))
-            
+
 all_enhancedrecons = transforms.Resize((256,256))(all_enhancedrecons).float()
 print("all_enhancedrecons", all_enhancedrecons.shape)
 torch.save(all_enhancedrecons,f"evals/{model_name}/{model_name}_all_enhancedrecons.pt")
@@ -273,5 +293,4 @@ print(f"saved evals/{model_name}/{model_name}_all_enhancedrecons.pt")
 
 if not utils.is_interactive():
     sys.exit(0)
-
 
