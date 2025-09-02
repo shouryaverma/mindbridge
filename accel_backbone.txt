@@ -27,8 +27,32 @@ accelerate launch --num_processes=$((1 * 1)) \
 --ckpt_saving \
 --ckpt_interval=2 \
 --wandb_log \
---wandb_project='mindbridge-pretraining
+--wandb_project='mindbridge-pretraining'
 
 --no-wandb_log
 
 --train_subjects=2 5 7 \
+
+# shared backbone fullmodel all sessions all subjects but 1 wandb-logged
+accelerate launch --num_processes=$((1 * 1)) \
+--num_machines=1 \
+--mixed_precision=fp16 train_shared_backbone.py \
+--data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+--cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+--model_name=shared_fullmodel_allSessions_allSubjectsBut1_withBlurryRecon \
+--batch_size=7 \
+--num_epochs=50 \
+--all_sessions \
+--val_sessions=1 \
+--hidden_dim=1024 \
+--n_blocks=4 \
+--use_prior \
+--prior_scale=30 \
+--blurry_recon \
+--clip_scale=1 \
+--max_lr=3e-4 \
+--mixup_pct=0.33 \
+--ckpt_saving \
+--ckpt_interval = 10 \
+--wandb_log \
+--wandb_project='mindbridge'

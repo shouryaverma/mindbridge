@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="shared_backbone_pretrained", help="Name for saving checkpoints and logging.")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the MindEye V2 dataset.")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="Directory for storing cached models (e.g., VAE).")
-    parser.add_argument("--train_subjects", type=int, nargs='+', default=[2, 5, 7], help="Subject IDs to use for pretraining.")
+    parser.add_argument("--train_subjects", type=int, nargs='+', default=[2, 3, 4, 5, 6, 7, 8], help="Subject IDs to use for pretraining.")
     parser.add_argument("--num_epochs", type=int, default=150, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=16, help="Per-device batch size.")
 
@@ -89,8 +89,8 @@ def parse_args():
     
     # --- Loss Scaling ---
     parser.add_argument("--clip_scale", type=float, default=1.0, help="Scaling factor for the CLIP contrastive loss.")
-    parser.add_argument("--prior_scale", type=float, default=30.0, help="Scaling factor for the diffusion prior loss.")
-    parser.add_argument("--blur_scale", type=float, default=0.5, help="Scaling factor for the blurry reconstruction loss.")
+    parser.add_argument("--prior_scale", type=float, default=1.0, help="Scaling factor for the diffusion prior loss.")
+    parser.add_argument("--blur_scale", type=float, default=1.0, help="Scaling factor for the blurry reconstruction loss.")
     
     # --- Learning Rate & Optimizer ---
     parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate for the scheduler.")
@@ -99,6 +99,7 @@ def parse_args():
     
     # --- Data & Augmentation ---
     parser.add_argument("--num_sessions", type=int, default=32, help="Number of fMRI sessions to use for training per subject.")
+    parser.add_argument("--all_sessions", action=argparse.BooleanOptionalAction, default=False, help="Use all fMRI sessions for training per subject.")
     parser.add_argument("--val_sessions", type=int, default=8, help="Number of sessions to reserve for validation per subject.")
     parser.add_argument("--use_image_aug", action=argparse.BooleanOptionalAction, default=False, help="Enable image augmentations.")
 
@@ -142,24 +143,30 @@ def main():
     accelerator.print("\n--- Loading Training Data ---")
     
     def my_split_by_node(urls): return urls
-    
-    # Calculate iterations per epoch
-    train_batch_size = batch_size // len(args.train_subjects)
-    num_samples_per_epoch = (750 * args.num_sessions) // num_devices
-    num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(args.train_subjects))
-
-    accelerator.print(f"Training sessions per subject: {args.num_sessions}")
-    accelerator.print(f"Validation sessions per subject: {args.val_sessions}")
-    accelerator.print(f"Batch size per subject: {train_batch_size}")
-    accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
     train_data, train_dl, val_data, val_dl = {}, {}, {}, {}
     voxels, num_voxels, num_voxels_list = {}, {}, []
     nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30])  # Subj 0 is a placeholder
+    
+    # Calculate iterations per epoch
+    train_batch_size = batch_size // len(args.train_subjects)
+    if args.all_sessions:
+        num_samples_per_epoch = (750 * 40) // num_devices 
+    else:
+        num_samples_per_epoch = (750 * args.num_sessions) // num_devices 
+    num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(args.train_subjects))
+
+    if args.all_sessions:
+        accelerator.print(f"Using all sessions for training")
+    else:
+        accelerator.print(f"Training sessions per subject: {args.num_sessions}")
+    accelerator.print(f"Validation sessions per subject: {args.val_sessions}")
+    accelerator.print(f"Batch size per subject: {train_batch_size}")
+    accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
     for s in args.train_subjects:
         # Training data (first N sessions)
-        train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
+        train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
         
         # Validation data (last M sessions)
         val_start = nsessions_allsubj[s] - args.val_sessions

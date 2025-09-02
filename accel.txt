@@ -125,6 +125,6 @@ accelerate launch --num_processes=$((1 * 1)) \
 sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=28 --mem=165G -t 48:00:00 
 
 # for Gautschi
-sinteractive -A pccr -p ai -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=128G -t 48:00:00
+sinteractive -A pccr -p ai -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=165G -t 48:00:00
 
 

@@ -3,6 +3,8 @@ train_logs/
 slurms/
 datasets/
 src/cache/
+src/inference_outputs/
+wandb.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
