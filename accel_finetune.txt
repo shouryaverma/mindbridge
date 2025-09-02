@@ -1,0 +1,17 @@
+# finetune on subj01, 5 epoch, 1 session of data, 2 blocks, 64 hidden dim
+accelerate launch finetune_single_subj.py \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --pretrained_model=/depot/natallah/data/shourya/mindbridge/MindEyeV2/train_logs/shared_smallmodel_Trn4sVal1s_withBlurryRecon/shared_backbone_last.pth \
+    --target_subject=1 \
+    --hidden_dim=64 \
+    --n_blocks=2 \
+    --num_sessions=1 \
+    --num_epochs=5 \
+    --batch_size=4 \
+    --model_name=subj01_finetune_small_model_1session_5epochs \
+    --max_lr=1e-4 \
+    --ckpt_interval=2 \
+    --seed=42 \
+    --wandb_log \
+    --wandb_project='mindbridge-pretraining'

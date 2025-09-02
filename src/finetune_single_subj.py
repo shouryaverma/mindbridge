@@ -143,18 +143,35 @@ def load_pretrained_model(model, pretrained_path, target_subject, accelerator):
         extended_voxel_counts = num_voxels_list + [target_voxel_count]
         new_ridge = RidgeRegression(extended_voxel_counts, model.ridge.out_features)
         
-        # Copy existing ridge weights
-        for i, linear in enumerate(model.ridge.linears):
-            new_ridge.linears[i].load_state_dict(linear.state_dict())
+        # Copy existing ridge weights for pretrained subjects
+        for i, voxel_count in enumerate(num_voxels_list):
+            # Find the corresponding linear layer in the pretrained ridge
+            pretrained_ridge_key = f'ridge.linears.{i}'
+            if f'{pretrained_ridge_key}.weight' in pretrained_state_dict:
+                new_ridge.linears[i].weight.data = pretrained_state_dict[f'{pretrained_ridge_key}.weight']
+                new_ridge.linears[i].bias.data = pretrained_state_dict[f'{pretrained_ridge_key}.bias']
+        
+        # Initialize the new ridge layer for target subject (random initialization)
+        # The new layer is at index len(num_voxels_list)
+        target_ridge_idx = len(num_voxels_list)
+        accelerator.print(f"Added new ridge layer for {target_voxel_count} voxels at index {target_ridge_idx}")
         
         # Replace ridge in model
         model.ridge = new_ridge
+
+        # Load the rest of the pretrained weights (excluding ridge layers)
+        model_state_dict = model.state_dict()
+        # Filter out ridge-related keys from pretrained state dict
+        filtered_pretrained_state_dict = {
+            k: v for k, v in pretrained_state_dict.items() 
+            if not k.startswith('ridge.')
+        }
         
         # Load pretrained weights (ridge layer will be partially loaded)
-        model.load_state_dict(pretrained_state_dict, strict=False)
-        target_ridge_idx = len(train_subjects)  # New ridge layer index
+        model_state_dict.update(filtered_pretrained_state_dict)
+        model.load_state_dict(model_state_dict, strict=True)
         
-        accelerator.print(f"Added new ridge layer for {target_voxel_count} voxels")
+        accelerator.print(f"Successfully loaded pretrained backbone and created new ridge layer")
     
     return target_ridge_idx
 
