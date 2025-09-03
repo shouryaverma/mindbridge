@@ -1,6 +1,5 @@
-python init_recon.py \
-        --model_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/train_logs/subj01_finetune/finetuned_subj01_last.pth \
-        --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
-        --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
-        --subject=1 \
-        --output_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/inference_outputs
+python inference.py \
+    --model_name=subj01_finetune \
+    --target_subject=1 \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache

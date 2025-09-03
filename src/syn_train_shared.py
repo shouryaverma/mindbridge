@@ -424,6 +424,10 @@ def main():
             val_fwd_acc = 0
             val_bwd_acc = 0
             val_gen_similarity = 0
+
+            # Collect embeddings for retrieval evaluation
+            all_val_brain_embeds = []
+            all_val_image_embeds = []
             
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
                 # Evaluate on validation sets from all training subjects
@@ -431,7 +435,7 @@ def main():
                     val_dl_iter = iter(val_dls_prepared[s_idx])
                     
                     # Sample a fixed number of batches for validation
-                    max_val_batches = 10  # Limit validation batches per subject
+                    max_val_batches = 20  # Limit validation batches per subject
                     val_batch_count = 0
                     
                     while val_batch_count < max_val_batches:
@@ -460,6 +464,10 @@ def main():
                         # Calculate validation metrics
                         val_clip_voxels_norm = nn.functional.normalize(val_clip_voxels.flatten(1), dim=-1)
                         val_clip_target_norm = nn.functional.normalize(val_clip_target.flatten(1), dim=-1)
+
+                        # Collect embeddings for retrieval evaluation
+                        all_val_brain_embeds.append(val_clip_voxels_norm.cpu())
+                        all_val_image_embeds.append(val_clip_target_norm.cpu())
                         
                         val_loss_clip = utils.soft_clip_loss(val_clip_voxels_norm, val_clip_target_norm, temp=0.006)
                         val_loss += (args.clip_scale * val_loss_clip).item()
@@ -483,26 +491,34 @@ def main():
                             val_gen_similarity += gen_similarity.item()
 
                         val_batches += 1
+
+                        # Compute retrieval metrics on accumulated embeddings
+                if len(all_val_brain_embeds) > 0:
+                    # Concatenate all collected embeddings
+                    all_brain_embeds = torch.cat(all_val_brain_embeds, dim=0).to(device)
+                    all_image_embeds = torch.cat(all_val_image_embeds, dim=0).to(device)
+                    
+                    # Only compute retrieval if we have enough samples
+                    if len(all_brain_embeds) >= 50:  # Minimum 50 samples for meaningful retrieval
+                        labels = torch.arange(len(all_brain_embeds)).to(device)
+                        sims = utils.batchwise_cosine_similarity(all_brain_embeds, all_image_embeds)
+                        val_fwd_acc = utils.topk(sims, labels, k=1).item()
+                        val_bwd_acc = utils.topk(sims.T, labels, k=1).item()
+                        accelerator.print(f"Retrieval evaluation on {len(all_brain_embeds)} samples")
+                    else:
+                        accelerator.print(f"Skipping retrieval evaluation - only {len(all_brain_embeds)} samples available")
+                        val_fwd_acc = 0.0
+                        val_bwd_acc = 0.0
                         
-                        # Retrieval metrics
-                        labels = torch.arange(len(val_clip_voxels_norm)).to(device)
-                        sims = utils.batchwise_cosine_similarity(val_clip_voxels_norm, val_clip_target_norm)
-                        val_fwd_acc += utils.topk(sims, labels, k=1).item()
-                        val_bwd_acc += utils.topk(sims.T, labels, k=1).item()
-            
-            # Average validation metrics
-            if val_batches > 0:
-                val_loss /= val_batches
-                val_fwd_acc /= val_batches
-                val_bwd_acc /= val_batches
-            
+            # logging metrics for WandB
             logs = {
                 "epoch": epoch,
-                "train/loss": epoch_loss / num_batches if num_batches > 0 else 0,
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
-            # add individual loss components (epoch averages)
+            # Training total loss and individual loss components
+            logs["train/total_loss"] = epoch_loss / num_batches if num_batches > 0 else 0
+
             if args.use_prior:
                 logs["train/prior_loss"] = epoch_prior_loss / num_batches if num_batches > 0 else 0
                 logs["train/prior_loss_scaled"] = (args.prior_scale * epoch_prior_loss / num_batches) if num_batches > 0 else 0
@@ -513,23 +529,23 @@ def main():
             if args.blurry_recon:
                 logs["train/blur_loss"] = epoch_blur_loss / num_batches if num_batches > 0 else 0
                 logs["train/blur_loss_scaled"] = (args.blur_scale * epoch_blur_loss / num_batches) if num_batches > 0 else 0
+            
+            if args.use_prior:
+                logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss)
+            logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss)
+            if args.blurry_recon:
+                logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss)
 
-            # Validation metrics
+            # Validation metrics: total loss, generation similarity, retrieval accuracy
             logs.update({
-                "val/total_loss": val_loss,
+                "val/total_loss": val_loss / val_batches if val_batches > 0 else 0,
                 "val/fwd_acc": val_fwd_acc,
                 "val/bwd_acc": val_bwd_acc,
             })
-            
             if args.use_prior:
                 logs["val/prior_generation_similarity"] = val_gen_similarity / val_batches if val_batches > 0 else 0
 
-            # Log loss ratios for monitoring balance
-            if args.use_prior:
-                logs["train/prior_ratio"] = (args.prior_scale * loss_prior / total_loss).item()
-            logs["train/clip_ratio"] = (args.clip_scale * loss_clip / total_loss).item()
-            if args.blurry_recon:
-                logs["train/blur_ratio"] = (args.blur_scale * loss_blurry / total_loss).item()
+            
             
             progress_bar.set_postfix(**logs)
             if args.wandb_log:
@@ -539,7 +555,7 @@ def main():
         if args.ckpt_saving and (epoch % args.ckpt_interval == 0 or epoch == args.num_epochs - 1):
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
-                save_path = os.path.join(outdir, 'shared_backbone_last.pth')
+                save_path = os.path.join(outdir, 'last.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': unwrapped_model.state_dict(),
