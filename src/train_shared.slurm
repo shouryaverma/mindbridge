@@ -5,6 +5,7 @@
 #SBATCH --job-name=mb_pretrain
 #SBATCH --nodes=1           
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=14
 #SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
 #SBATCH -e slurms/%j.err        # first create a "slurms" folder in current directory to store logs
 #SBATCH -o slurms/%j.out
@@ -12,7 +13,7 @@
 #SBATCH --no-requeue
 #SBATCH --exclusive
 
-# Make sure you activate your fmri environment created from src/setup.sh
+# Make sure you activate your fmri environment
 module load conda
 conda activate /depot/natallah/data/roy/conda_envs/fmri
 

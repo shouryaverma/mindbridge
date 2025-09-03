@@ -6,11 +6,29 @@ This script pretrains the shared backbone on multiple subjects' data.
 The pretrained model can then be fine-tuned on a new subject using the fine-tuning script.
 
 Usage:
-    $ accelerate launch train_shared_backbone.py \
-        --data_path=/path/to/dataset \
-        --train_subjects 2 5 7 \
-        --num_sessions=32 \
-        --model_name=shared_backbone_pretrained
+    $ accelerate launch --num_processes=$((1 * 1)) \
+        --num_machines=1 \
+        --mixed_precision=fp16 syn_train_shared.py \
+        --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+        --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+        --model_name=debug_shared_smallModel_subsetSessions \
+        --batch_size=21 \
+        --num_epochs=10 \
+        --train_sessions=4 \
+        --val_sessions=1 \
+        --hidden_dim=64 \
+        --n_blocks=2 \
+        --use_prior \
+        --prior_scale=1 \
+        --blurry_recon \
+        --blur_scale=1 \
+        --clip_scale=1 \
+        --max_lr=3e-4 \
+        --mixup_pct=0.33 \
+        --ckpt_saving \
+        --ckpt_interval=2 \
+        --wandb_log \
+        --wandb_project='mindbridge'
 """
 
 import os
@@ -89,7 +107,7 @@ def parse_args():
     
     # --- Loss Scaling ---
     parser.add_argument("--clip_scale", type=float, default=1.0, help="Scaling factor for the CLIP contrastive loss.")
-    parser.add_argument("--prior_scale", type=float, default=30.0, help="Scaling factor for the diffusion prior loss.")
+    parser.add_argument("--prior_scale", type=float, default=1.0, help="Scaling factor for the diffusion prior loss.")
     parser.add_argument("--blur_scale", type=float, default=1.0, help="Scaling factor for the blurry reconstruction loss.")
     
     # --- Learning Rate & Optimizer ---
@@ -98,7 +116,7 @@ def parse_args():
     parser.add_argument("--mixup_pct", type=float, default=0.33, help="Percentage of training to use MixCo before switching to SoftCLIP.")
     
     # --- Data & Augmentation ---
-    parser.add_argument("--num_sessions", type=int, default=32, help="Number of fMRI sessions to use for training per subject.")
+    parser.add_argument("--train_sessions", type=int, default=32, help="Number of fMRI sessions to use for training per subject.")
     parser.add_argument("--all_sessions", action=argparse.BooleanOptionalAction, default=False, help="Use all fMRI sessions for training per subject.")
     parser.add_argument("--val_sessions", type=int, default=8, help="Number of sessions to reserve for validation per subject.")
     parser.add_argument("--use_image_aug", action=argparse.BooleanOptionalAction, default=False, help="Enable image augmentations.")
@@ -153,13 +171,13 @@ def main():
     if args.all_sessions:
         num_samples_per_epoch = (750 * 40) // num_devices 
     else:
-        num_samples_per_epoch = (750 * args.num_sessions) // num_devices 
+        num_samples_per_epoch = (750 * args.train_sessions) // num_devices 
     num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(args.train_subjects))
 
     if args.all_sessions:
         accelerator.print(f"Using all sessions for training")
     else:
-        accelerator.print(f"Training sessions per subject: {args.num_sessions}")
+        accelerator.print(f"Training sessions per subject: {args.train_sessions}")
     accelerator.print(f"Validation sessions per subject: {args.val_sessions}")
     accelerator.print(f"Batch size per subject: {train_batch_size}")
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
@@ -369,7 +387,8 @@ def main():
                     betas_list = [betas_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
                     select_list = [select_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
                     perm, betas, select = torch.cat(perm_list), torch.cat(betas_list), torch.cat(select_list)
-            
+
+                # Forward pass through target subject's ridge layer
                 voxel_ridge_list = [model.ridge(voxel_list[s_idx], s_idx) for s_idx, s in enumerate(args.train_subjects)]
                 voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
                 
@@ -492,7 +511,7 @@ def main():
 
                         val_batches += 1
 
-                        # Compute retrieval metrics on accumulated embeddings
+                # Compute retrieval metrics on accumulated embeddings
                 if len(all_val_brain_embeds) > 0:
                     # Concatenate all collected embeddings
                     all_brain_embeds = torch.cat(all_val_brain_embeds, dim=0).to(device)

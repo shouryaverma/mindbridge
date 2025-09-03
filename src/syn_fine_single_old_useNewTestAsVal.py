@@ -98,9 +98,9 @@ def parse_args():
     parser.add_argument("--mixup_pct", type=float, default=0.33, help="Percentage of training to use MixCo before switching to SoftCLIP.")
     
     # --- Data & Augmentation ---
-    parser.add_argument("--train_sessions", type=int, default=1, help="Number of fMRI sessions to use for fine-tuning.")
-    parser.add_argument("--val_sessions", type=int, default=1, help="Number of fMRI sessions to use for validation.")
+    parser.add_argument("--num_sessions", type=int, default=1, help="Number of fMRI sessions to use for fine-tuning.")
     parser.add_argument("--use_image_aug", action=argparse.BooleanOptionalAction, default=False, help="Enable image augmentations.")
+    parser.add_argument("--new_test", action=argparse.BooleanOptionalAction, default=True, help="Use the new, larger test set.")
 
     # --- Logging & Checkpointing ---
     parser.add_argument("--wandb_log", action=argparse.BooleanOptionalAction, default=False, help="Enable logging to Weights & Biases.")
@@ -203,37 +203,44 @@ def main():
     
     def my_split_by_node(urls): return urls
     
-    num_samples_per_epoch = (750 * args.train_sessions) // num_devices
+    num_samples_per_epoch = (750 * args.num_sessions) // num_devices
     num_iterations_per_epoch = num_samples_per_epoch // batch_size
 
-    accelerator.print(f"Fine-tuning sessions: {args.train_sessions}")
+    accelerator.print(f"Fine-tuning sessions: {args.num_sessions}")
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
-    nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30])  # Subj 0 is a placeholder
-
-    # Training dataloader for target subject (first N sessions)
-    train_url = f"{args.data_path}/wds/subj0{args.target_subject}/train/" + "{0.." + f"{args.train_sessions-1}" + "}.tar"
+    # Training dataloader for target subject
+    train_url = f"{args.data_path}/wds/subj0{args.target_subject}/train/" + "{0.." + f"{args.num_sessions-1}" + "}.tar"
     train_data = wds.WebDataset(train_url, resampled=True, nodesplitter=my_split_by_node) \
         .shuffle(750, initial=1500, rng=random.Random(args.seed)) \
         .decode("torch") \
         .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
         .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
+    
     train_dl = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, drop_last=True, pin_memory=True)
-
-    # Validation dataloader (last M sessions)
-    val_start = nsessions_allsubj[args.target_subject] - args.val_sessions
-    val_url = f"{args.data_path}/wds/subj0{args.target_subject}/train/" + "{" + f"{val_start}.." + f"{nsessions_allsubj[args.target_subject]-1}" + "}.tar"
-    val_data = wds.WebDataset(val_url, resampled=False, nodesplitter=my_split_by_node) \
-        .decode("torch") \
-        .rename(behav="behav.npy") \
-        .to_tuple("behav")
-    val_dl = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size, shuffle=False, drop_last=True, pin_memory=True)
-    accelerator.print(f"Loaded validation data with {len(val_dl)} samples.")
 
     # Load target subject's voxel data
     with h5py.File(f'{args.data_path}/betas_all_subj0{args.target_subject}_fp32_renorm.hdf5', 'r') as f:
         voxels = torch.from_numpy(f['betas'][:]).to("cpu").to(torch.float16)
     accelerator.print(f"Loaded {voxels.shape[1]} voxels for target subject {args.target_subject}")
+
+    # Validation dataloader (test set)
+    test_url = f"{args.data_path}/wds/subj0{args.target_subject}/"
+    if args.new_test:
+        test_url += "new_test/0.tar"
+        num_test_samples = {1: 3000, 2: 3000, 3: 2371, 4: 2188, 5: 3000, 6: 2371, 7: 3000, 8: 2188}
+        num_test = num_test_samples[args.target_subject]
+    else:
+        test_url += "test/0.tar"
+        num_test_samples = {1: 2770, 2: 2770, 3: 2113, 4: 1985, 5: 2770, 6: 2113, 7: 2770, 8: 1985}
+        num_test = num_test_samples[args.target_subject]
+        
+    test_data = wds.WebDataset(test_url, resampled=False, nodesplitter=my_split_by_node) \
+        .decode("torch") \
+        .rename(behav="behav.npy") \
+        .to_tuple("behav")
+    test_dl = torch.utils.data.DataLoader(test_data, batch_size=num_test, shuffle=False, drop_last=True, pin_memory=True)
+    accelerator.print(f"Loaded validation data with {num_test} samples.")
     
     # Load all 73k COCO images
     with h5py.File(f'{args.data_path}/coco_images_224_float16.hdf5', 'r') as f:
@@ -320,8 +327,8 @@ def main():
         )
 
     # --- Prepare everything with Accelerator ---
-    model, optimizer, train_dl_prepared, val_dl_prepared, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dl_prepared, val_dl, lr_scheduler
+    model, optimizer, train_dl, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dl, lr_scheduler
     )
     
     # --- Weights & Biases Logging ---
@@ -339,6 +346,7 @@ def main():
     accelerator.print(f"\n--- Starting fine-tuning for subject {args.target_subject} ---")
     progress_bar = tqdm(range(args.num_epochs), disable=not accelerator.is_main_process)
     
+    test_image, test_voxel = None, None
     mse = nn.MSELoss()
     l1 = nn.L1Loss()
     soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, args.num_epochs - int(args.mixup_pct * args.num_epochs))
@@ -455,102 +463,90 @@ def main():
         # --- End of Epoch Evaluation ---
         if accelerator.is_main_process:
             model.eval()
-            val_loss = 0
-            val_batches = 0
-            val_fwd_acc = 0
-            val_bwd_acc = 0
-            val_gen_similarity = 0
-
-            # Collect embeddings for retrieval evaluation
-            all_val_brain_embeds = []
-            all_val_image_embeds = []
-
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-                val_dl_iter = iter(val_dl_prepared)
-                # Sample a fixed number of batches for validation
-                max_val_batches = 20  # Limit validation batches per subject
-                val_batch_count = 0
-
-                while val_batch_count < max_val_batches:
-                    try:
-                        val_behav, _, _, _ = next(val_dl_iter)
-                        val_batch_count += 1
-                    except StopIteration:
-                        # No more batches available for this subject
-                        break
-                        
-                    # Process validation batch
-                    val_img_indices = val_behav[:,0,0].cpu().long().numpy()
-                    val_unique_indices, val_sorted_idx = np.unique(val_img_indices, return_index=True)
-                    if len(val_unique_indices) != len(val_img_indices):
-                        continue
-                        
-                    val_image_batch = torch.from_numpy(images[val_unique_indices]).to(torch.float16).to(device)
-                    val_voxel_indices = val_behav[:,0,5].cpu().long().numpy()[val_sorted_idx]
-                    val_voxel_batch = voxels[f'subj0{s}'][val_voxel_indices].unsqueeze(1).to(device)
+                # Prepare test data by averaging 3 repeats of the same image
+                if test_image is None:
+                    test_behav = next(iter(test_dl))[0]
+                    voxel = voxels[test_behav[:,0,5].cpu().long()].unsqueeze(1)
+                    image_indices = test_behav[:,0,0].cpu().long()
                     
-                    # Forward pass
-                    val_clip_target = clip_img_embedder(val_image_batch)
-                    val_voxel_ridge = accelerator.unwrap_model(model).ridge(val_voxel_batch, s_idx)
-                    _, val_clip_voxels, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
+                    unique_images = torch.unique(image_indices)
+                    test_voxel_list, test_image_list = [], []
+                    for img_idx in unique_images:
+                        locs = torch.where(img_idx == image_indices)[0]
+                        if len(locs) < 3: continue  # Skip images with fewer than 3 repeats
+                        test_voxel_list.append(voxel[locs[:3]].unsqueeze(0))
+                        test_image_list.append(torch.from_numpy(images[img_idx]).unsqueeze(0))
                     
-                    # Calculate validation metrics
-                    val_clip_voxels_norm = nn.functional.normalize(val_clip_voxels.flatten(1), dim=-1)
-                    val_clip_target_norm = nn.functional.normalize(val_clip_target.flatten(1), dim=-1)
-
-                    # Collect embeddings for retrieval evaluation
-                    all_val_brain_embeds.append(val_clip_voxels_norm.cpu())
-                    all_val_image_embeds.append(val_clip_target_norm.cpu())
-                    
-                    val_loss_clip = utils.soft_clip_loss(val_clip_voxels_norm, val_clip_target_norm, temp=0.006)
-                    val_loss += (args.clip_scale * val_loss_clip).item()
-                    
-                    # Add prior validation loss
-                    if args.use_prior:
-                        val_backbone_features, _, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
-                        val_loss_prior, _ = accelerator.unwrap_model(model).rectified_flow(text_embed=val_backbone_features, image_embed=val_clip_target)
-                        val_loss += (args.prior_scale * val_loss_prior).item()
-
-                        # Test rectified flow generation quality
-                        generated_embeddings = accelerator.unwrap_model(model).rectified_flow.sample(
-                            text_embed=val_backbone_features[:5], 
-                            num_steps=20
-                        )
-                        gen_similarity = torch.nn.functional.cosine_similarity(
-                            generated_embeddings.flatten(1), 
-                            val_clip_target[:5].flatten(1), 
-                            dim=-1
-                        ).mean()
-                        val_gen_similarity += gen_similarity.item()
-
-                    val_batches += 1
+                    test_voxel = torch.cat(test_voxel_list, dim=0).to(device)
+                    test_image = torch.cat(test_image_list, dim=0).to(device)
                 
-                # Compute retrieval metrics on accumulated embeddings
-                if len(all_val_brain_embeds) > 0:
-                    # Concatenate all collected embeddings
-                    all_brain_embeds = torch.cat(all_val_brain_embeds, dim=0).to(device)
-                    all_image_embeds = torch.cat(all_val_image_embeds, dim=0).to(device)
-                    
-                    # Only compute retrieval if we have enough samples
-                    if len(all_brain_embeds) >= 50:  # Minimum 50 samples for meaningful retrieval
-                        labels = torch.arange(len(all_brain_embeds)).to(device)
-                        sims = utils.batchwise_cosine_similarity(all_brain_embeds, all_image_embeds)
-                        val_fwd_acc = utils.topk(sims, labels, k=1).item()
-                        val_bwd_acc = utils.topk(sims.T, labels, k=1).item()
-                        accelerator.print(f"Retrieval evaluation on {len(all_brain_embeds)} samples")
-                    else:
-                        accelerator.print(f"Skipping retrieval evaluation - only {len(all_brain_embeds)} samples available")
-                        val_fwd_acc = 0.0
-                        val_bwd_acc = 0.0
+                # Evaluate on a subset for speed
+                eval_indices = torch.arange(len(test_voxel))[:300]
+                voxel_eval = test_voxel[eval_indices].to(next(model.parameters()).dtype)
+                image_eval = test_image[eval_indices].to(torch.float16)
+                
+                clip_target_eval = clip_img_embedder(image_eval)
+
+                val_total_loss = 0
+                val_prior_loss = 0
+                val_blur_loss = 0
+                
+                # Average voxel embeddings over 3 repeats
+                clip_voxels_avg = 0
+                for rep in range(3):
+                    voxel_ridge_eval = accelerator.unwrap_model(model).ridge(voxel_eval[:, rep], target_ridge_idx)
+                    _, clip_voxels_eval, _ = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
+                    clip_voxels_avg += clip_voxels_eval
+                clip_voxels_avg /= 3
+                
+                clip_voxels_norm_eval = nn.functional.normalize(clip_voxels_avg.flatten(1), dim=-1)
+                clip_target_norm_eval = nn.functional.normalize(clip_target_eval.flatten(1), dim=-1)
+                
+                # --- Calculate Evaluation Metrics ---
+                labels = torch.arange(len(clip_voxels_norm_eval)).to(device)
+                sims = utils.batchwise_cosine_similarity(clip_voxels_norm_eval, clip_target_norm_eval)
+                test_fwd_pct_correct = utils.topk(sims, labels, k=1).item()
+                test_bwd_pct_correct = utils.topk(sims.T, labels, k=1).item()
+                
+                eval_loss_clip = utils.soft_clip_loss(clip_voxels_norm_eval, clip_target_norm_eval, temp=0.006)
+                val_total_loss += (args.clip_scale * eval_loss_clip).item()
+                
+                # Add validation prior loss
+                if args.use_prior:
+                    backbone_features_eval, _, _ = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
+                    val_loss_prior, _ = accelerator.unwrap_model(model).rectified_flow(text_embed=backbone_features_eval, image_embed=clip_target_eval)
+                    val_prior_loss = val_loss_prior.item()
+                    val_total_loss += (args.prior_scale * val_loss_prior).item()
+
+                    # Test rectified flow generation quality
+                    generated_embeddings = accelerator.unwrap_model(model).rectified_flow.sample(
+                        text_embed=backbone_features_eval[:10], 
+                        num_steps=20
+                    )
+                    val_gen_similarity = torch.nn.functional.cosine_similarity(
+                        generated_embeddings.flatten(1), 
+                        clip_target_eval[:10].flatten(1), 
+                        dim=-1
+                    ).mean().item()
+                
+                # Add validation blur loss  
+                if args.blurry_recon:
+                    _, _, val_blurry_image_enc = accelerator.unwrap_model(model).backbone(voxel_ridge_eval)
+                    val_image_enc_pred, _ = val_blurry_image_enc
+                    with torch.no_grad():
+                        val_image_enc = autoenc.encode(2 * image_eval - 1).latent_dist.mode() * 0.18215
+                    val_loss_blur = l1(val_image_enc_pred, val_image_enc)
+                    val_blur_loss = val_loss_blur.item()
+                    val_total_loss += (args.blur_scale * val_loss_blur).item()
             
             logs = {
                 "epoch": epoch,
+                "train/loss": epoch_loss / num_batches if num_batches > 0 else 0,
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
-            # Training losses
-            logs["train/loss"] = epoch_loss / num_batches if num_batches > 0 else 0
-            
+            # Add individual loss components (epoch averages)
             if args.use_prior:
                 logs["train/prior_loss"] = epoch_prior_loss / num_batches if num_batches > 0 else 0
                 logs["train/prior_loss_scaled"] = (args.prior_scale * epoch_prior_loss / num_batches) if num_batches > 0 else 0
@@ -565,9 +561,9 @@ def main():
             # Validation metrics
             logs.update({
                 "val/total_loss": val_total_loss,
-                "val/clip_loss": val_loss_clip.item(),
-                "val/fwd_acc": val_fwd_acc,
-                "val/bwd_acc": val_bwd_acc,
+                "val/clip_loss": eval_loss_clip.item(),
+                "val/fwd_acc": test_fwd_pct_correct,
+                "val/bwd_acc": test_bwd_pct_correct,
             })
             
             if args.use_prior:
@@ -581,12 +577,12 @@ def main():
             if args.blurry_recon:
                 logs["val/blur_loss"] = val_blur_loss
 
-            # Loss ratios for monitoring balance
+            # Log loss ratios for monitoring balance
             if args.use_prior:
-                logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss).item()
-            logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss).item()
+                logs["train/prior_ratio"] = (args.prior_scale * loss_prior / total_loss).item()
+            logs["train/clip_ratio"] = (args.clip_scale * loss_clip / total_loss).item()
             if args.blurry_recon:
-                logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss).item()
+                logs["train/blur_ratio"] = (args.blur_scale * loss_blurry / total_loss).item()
 
             progress_bar.set_postfix(**logs)
             if args.wandb_log:

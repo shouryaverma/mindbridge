@@ -7,28 +7,28 @@ sinteractive -A pccr -N 1 -p ai -q preemptible -t 4:00:00 --gpus-per-node=1 --cp
 
 # shared backbone debug: smallmodel 4 sessions wandb-logged withBlurryRecon
 accelerate launch --num_processes=$((1 * 1)) \
---num_machines=1 \
---mixed_precision=fp16 syn_train_shared.py \
---data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
---cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
---model_name=debug_shared_smallModel_subsetSessions \
---batch_size=21 \
---num_epochs=10 \
---num_sessions=4 \
---val_sessions=1 \
---hidden_dim=64 \
---n_blocks=2 \
---use_prior \
---prior_scale=1 \
---blurry_recon \
---blur_scale=1 \
---clip_scale=1 \
---max_lr=3e-4 \
---mixup_pct=0.33 \
---ckpt_saving \
---ckpt_interval=2 \
---wandb_log \
---wandb_project='mindbridge'
+    --num_machines=1 \
+    --mixed_precision=fp16 syn_train_shared.py \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --model_name=debug_shared_smallModel_subsetSessions \
+    --batch_size=21 \
+    --num_epochs=10 \
+    --train_sessions=4 \
+    --val_sessions=1 \
+    --hidden_dim=64 \
+    --n_blocks=2 \
+    --use_prior \
+    --prior_scale=1 \
+    --blurry_recon \
+    --blur_scale=1 \
+    --clip_scale=1 \
+    --max_lr=3e-4 \
+    --mixup_pct=0.33 \
+    --ckpt_saving \
+    --ckpt_interval=2 \
+    --wandb_log \
+    --wandb_project='mindbridge'
 
 --no-wandb_log
 
@@ -36,24 +36,24 @@ accelerate launch --num_processes=$((1 * 1)) \
 
 # shared backbone fullmodel all sessions all subjects but 1 wandb-logged
 accelerate launch --num_processes=$((1 * 1)) \
---num_machines=1 \
---mixed_precision=fp16 syn_train_shared.py \
---data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
---cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
---model_name=shared_fullmodel_allSessions_allSubjectsBut1_withBlurryRecon \
---batch_size=21 \
---num_epochs=50 \
---all_sessions \
---val_sessions=1 \
---hidden_dim=1024 \
---n_blocks=4 \
---use_prior \
---prior_scale=30 \
---blurry_recon \
---clip_scale=1 \
---max_lr=3e-4 \
---mixup_pct=0.33 \
---ckpt_saving \
---ckpt_interval = 10 \
---wandb_log \
---wandb_project='mindbridge'
+    --num_machines=1 \
+    --mixed_precision=fp16 syn_train_shared.py \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --model_name=shared_fullmodel_allSessions_allSubjectsBut1_withBlurryRecon \
+    --batch_size=21 \
+    --num_epochs=50 \
+    --all_sessions \
+    --val_sessions=1 \
+    --hidden_dim=1024 \
+    --n_blocks=4 \
+    --use_prior \
+    --prior_scale=30 \
+    --blurry_recon \
+    --clip_scale=1 \
+    --max_lr=3e-4 \
+    --mixup_pct=0.33 \
+    --ckpt_saving \
+    --ckpt_interval = 10 \
+    --wandb_log \
+    --wandb_project='mindbridge'
