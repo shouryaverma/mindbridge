@@ -1,3 +1,4 @@
+# for Gautschi
 sinteractive -A pccr -N 1 -p ai -q preemptible -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
 # for Gilbreth
 sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=120G -t 48:00:00 

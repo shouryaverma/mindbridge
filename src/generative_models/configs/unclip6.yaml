@@ -77,6 +77,7 @@ model:
               repeat_to_max_len: False
               output_tokens: True
               only_tokens: True
+              cache_dir: /depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
           # vector cond
           - is_trainable: False
             input_key: original_size_as_tuple

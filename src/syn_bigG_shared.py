@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
-MindEye V2 Single Subject Fine-tuning Script
+MindEye V2 Shared Backbone Pretraining Script
 
-This script fine-tunes a pretrained shared backbone on a single target subject's data.
-The pretrained backbone should be trained using train_shared_backbone.py first.
+This script pretrains the shared backbone on multiple subjects' data.
+The pretrained model can then be fine-tuned on a new subject using the fine-tuning script.
 
 Usage:
-    $ accelerate launch finetune_single_subject.py \
-        --data_path=/path/to/dataset \
-        --pretrained_model=/path/to/shared_backbone_last.pth \
-        --target_subject=1 \
-        --num_sessions=1 \
-        --model_name=subj01_finetuned
+    $ accelerate launch --num_processes=$((1 * 1)) \
+        --num_machines=1 \
+        --mixed_precision=fp16 syn_train_shared.py \
+        --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+        --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+        --model_name=debug_shared_smallModel_subsetSessions \
+        --batch_size=21 \
+        --num_epochs=10 \
+        --train_sessions=4 \
+        --val_sessions=1 \
+        --hidden_dim=64 \
+        --n_blocks=2 \
+        --use_prior \
+        --prior_scale=1 \
+        --blurry_recon \
+        --blur_scale=1 \
+        --clip_scale=1 \
+        --max_lr=3e-4 \
+        --mixup_pct=0.33 \
+        --ckpt_saving \
+        --ckpt_interval=2 \
+        --wandb_log \
+        --wandb_project='mindbridge'
 """
 
 import os
@@ -28,6 +45,8 @@ import webdataset as wds
 from accelerate import Accelerator
 from diffusers import AutoencoderKL
 import matplotlib.pyplot as plt
+import kornia
+from kornia.augmentation.container import AugmentationSequential
 
 # SDXL unCLIP requires code from https://github.com/Stability-AI/generative-models/
 try:
@@ -69,16 +88,15 @@ class RidgeRegression(nn.Module):
         return self.linears[subj_idx](x[:, 0]).unsqueeze(1)
 
 def parse_args():
-    """Defines and parses command-line arguments for the fine-tuning script."""
-    parser = argparse.ArgumentParser(description="MindEye V2 Single Subject Fine-tuning Configuration")
+    """Defines and parses command-line arguments for the shared backbone pretraining script."""
+    parser = argparse.ArgumentParser(description="MindEye V2 Shared Backbone Pretraining Configuration")
     
     # --- Essential Args ---
-    parser.add_argument("--model_name", type=str, default="subj_finetuned", help="Name for saving checkpoints and logging.")
+    parser.add_argument("--model_name", type=str, default="shared_backbone_pretrained", help="Name for saving checkpoints and logging.")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the MindEye V2 dataset.")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="Directory for storing cached models (e.g., VAE).")
-    parser.add_argument("--pretrained_model", type=str, required=True, help="Path to pretrained shared backbone checkpoint.")
-    parser.add_argument("--target_subject", type=int, required=True, choices=[1, 2, 5, 7], help="Target subject ID to fine-tune on.")
-    parser.add_argument("--num_epochs", type=int, default=50, help="Number of fine-tuning epochs.")
+    parser.add_argument("--train_subjects", type=int, nargs='+', default=[2, 3, 4, 5, 6, 7, 8], help="Subject IDs to use for pretraining.")
+    parser.add_argument("--num_epochs", type=int, default=150, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=16, help="Per-device batch size.")
 
     # --- Model & Training Strategy ---
@@ -93,87 +111,26 @@ def parse_args():
     parser.add_argument("--blur_scale", type=float, default=1.0, help="Scaling factor for the blurry reconstruction loss.")
     
     # --- Learning Rate & Optimizer ---
-    parser.add_argument("--max_lr", type=float, default=1e-4, help="Maximum learning rate for fine-tuning (lower than pretraining).")
+    parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate for the scheduler.")
     parser.add_argument("--lr_scheduler_type", type=str, default='cycle', choices=['cycle', 'linear'], help="Learning rate scheduler type.")
     parser.add_argument("--mixup_pct", type=float, default=0.33, help="Percentage of training to use MixCo before switching to SoftCLIP.")
     
     # --- Data & Augmentation ---
-    parser.add_argument("--train_sessions", type=int, default=1, help="Number of fMRI sessions to use for fine-tuning.")
-    parser.add_argument("--val_sessions", type=int, default=1, help="Number of fMRI sessions to use for validation.")
+    parser.add_argument("--train_sessions", type=int, default=32, help="Number of fMRI sessions to use for training per subject.")
+    parser.add_argument("--all_sessions", action=argparse.BooleanOptionalAction, default=False, help="Use all fMRI sessions for training per subject.")
+    parser.add_argument("--val_sessions", type=int, default=8, help="Number of sessions to reserve for validation per subject.")
     parser.add_argument("--use_image_aug", action=argparse.BooleanOptionalAction, default=False, help="Enable image augmentations.")
 
     # --- Logging & Checkpointing ---
     parser.add_argument("--wandb_log", action=argparse.BooleanOptionalAction, default=False, help="Enable logging to Weights & Biases.")
-    parser.add_argument("--wandb_project", type=str, default="mindeye-v2-finetuning", help="W&B project name.")
+    parser.add_argument("--wandb_project", type=str, default="mindeye-v2-pretraining", help="W&B project name.")
     parser.add_argument("--ckpt_saving", action=argparse.BooleanOptionalAction, default=True, help="Enable saving model checkpoints.")
-    parser.add_argument("--ckpt_interval", type=int, default=10, help="Epoch interval for saving checkpoints.")
+    parser.add_argument("--ckpt_interval", type=int, default=5, help="Epoch interval for saving checkpoints.")
     
     # --- System & Reproducibility ---
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
 
     return parser.parse_args()
-
-def load_pretrained_model(model, pretrained_path, target_subject, accelerator):
-    """Load pretrained shared backbone and add target subject's ridge layer if needed."""
-    accelerator.print(f"Loading pretrained model from {pretrained_path}")
-    checkpoint = torch.load(pretrained_path, map_location='cpu')
-    
-    pretrained_state_dict = checkpoint['model_state_dict']
-    train_subjects = checkpoint['train_subjects']
-    num_voxels_list = checkpoint['num_voxels_list']
-    
-    accelerator.print(f"Pretrained on subjects: {train_subjects}")
-    
-    # Check if target subject was in pretraining
-    if target_subject in train_subjects:
-        # Target subject already has a ridge layer
-        accelerator.print(f"Target subject {target_subject} was in pretraining, using existing ridge layer")
-        model.load_state_dict(pretrained_state_dict, strict=True)
-        target_ridge_idx = train_subjects.index(target_subject)
-    else:
-        # Need to add new ridge layer for target subject
-        accelerator.print(f"Target subject {target_subject} not in pretraining, adding new ridge layer")
-        
-        # Load target subject's voxel data to get dimensions
-        data_path = checkpoint['args']['data_path']
-        with h5py.File(f'{data_path}/betas_all_subj0{target_subject}_fp32_renorm.hdf5', 'r') as f:
-            target_voxel_count = f['betas'].shape[1]
-        
-        # Extend ridge regression with new layer
-        extended_voxel_counts = num_voxels_list + [target_voxel_count]
-        new_ridge = RidgeRegression(extended_voxel_counts, model.ridge.out_features)
-        
-        # Copy existing ridge weights for pretrained subjects
-        for i, voxel_count in enumerate(num_voxels_list):
-            # Find the corresponding linear layer in the pretrained ridge
-            pretrained_ridge_key = f'ridge.linears.{i}'
-            if f'{pretrained_ridge_key}.weight' in pretrained_state_dict:
-                new_ridge.linears[i].weight.data = pretrained_state_dict[f'{pretrained_ridge_key}.weight']
-                new_ridge.linears[i].bias.data = pretrained_state_dict[f'{pretrained_ridge_key}.bias']
-        
-        # Initialize the new ridge layer for target subject (random initialization)
-        # The new layer is at index len(num_voxels_list)
-        target_ridge_idx = len(num_voxels_list)
-        accelerator.print(f"Added new ridge layer for {target_voxel_count} voxels at index {target_ridge_idx}")
-        
-        # Replace ridge in model
-        model.ridge = new_ridge
-
-        # Load the rest of the pretrained weights (excluding ridge layers)
-        model_state_dict = model.state_dict()
-        # Filter out ridge-related keys from pretrained state dict
-        filtered_pretrained_state_dict = {
-            k: v for k, v in pretrained_state_dict.items() 
-            if not k.startswith('ridge.')
-        }
-        
-        # Load pretrained weights (ridge layer will be partially loaded)
-        model_state_dict.update(filtered_pretrained_state_dict)
-        model.load_state_dict(model_state_dict, strict=True)
-        
-        accelerator.print(f"Successfully loaded pretrained backbone and created new ridge layer")
-    
-    return target_ridge_idx
 
 def main():
     args = parse_args()
@@ -184,14 +141,16 @@ def main():
     device = accelerator.device
     num_devices = accelerator.num_processes
     
+    # Batch size per device
     batch_size = args.batch_size
     global_batch_size = batch_size * num_devices
 
-    accelerator.print("--- Single Subject Fine-tuning Configuration ---")
+    accelerator.print("--- Shared Backbone Pretraining Configuration ---")
     accelerator.print(f"Distributed: {accelerator.state.distributed_type != 'NO'}, Num Devices: {num_devices}")
     accelerator.print(f"Per-device Batch Size: {batch_size}, Global Batch Size: {global_batch_size}")
     accelerator.print(f"Mixed Precision: {accelerator.state.mixed_precision}")
-    accelerator.print(f"Model: {args.model_name}, Target Subject: {args.target_subject}")
+    accelerator.print(f"Model: {args.model_name}")
+    accelerator.print(f"Training Subjects: {args.train_subjects}")
     
     # --- Output Directory ---
     outdir = os.path.abspath(f'../train_logs/{args.model_name}')
@@ -199,41 +158,56 @@ def main():
         os.makedirs(outdir, exist_ok=True)
 
     # --- Data Loading ---
-    accelerator.print("\n--- Loading Target Subject Data ---")
+    accelerator.print("\n--- Loading Training Data ---")
     
     def my_split_by_node(urls): return urls
-    
-    num_samples_per_epoch = (750 * args.train_sessions) // num_devices
-    num_iterations_per_epoch = num_samples_per_epoch // batch_size
 
-    accelerator.print(f"Fine-tuning sessions: {args.train_sessions}")
+    train_data, train_dl, val_data, val_dl = {}, {}, {}, {}
+    voxels, num_voxels, num_voxels_list = {}, {}, []
+    nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30])  # Subj 0 is a placeholder
+    
+    # Calculate iterations per epoch
+    train_batch_size = batch_size // len(args.train_subjects)
+    if args.all_sessions:
+        num_samples_per_epoch = (750 * 40) // num_devices 
+    else:
+        num_samples_per_epoch = (750 * args.train_sessions) // num_devices 
+    num_iterations_per_epoch = num_samples_per_epoch // (train_batch_size * len(args.train_subjects))
+
+    if args.all_sessions:
+        accelerator.print(f"Using all sessions for training")
+    else:
+        accelerator.print(f"Training sessions per subject: {args.train_sessions}")
+    accelerator.print(f"Validation sessions per subject: {args.val_sessions}")
+    accelerator.print(f"Batch size per subject: {train_batch_size}")
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
-    nsessions_allsubj = np.array([0, 40, 40, 32, 30, 40, 32, 40, 30])  # Subj 0 is a placeholder
+    for s in args.train_subjects:
+        # Training dataloader (first N sessions)
+        train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
+        train_data[f'subj0{s}'] = wds.WebDataset(train_url, resampled=True, nodesplitter=my_split_by_node) \
+            .shuffle(750, initial=1500, rng=random.Random(args.seed)) \
+            .decode("torch") \
+            .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
+            .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
+        train_dl[f'subj0{s}'] = torch.utils.data.DataLoader(train_data[f'subj0{s}'], batch_size=train_batch_size, shuffle=False, drop_last=True, pin_memory=True)
 
-    # Training dataloader for target subject (first N sessions)
-    train_url = f"{args.data_path}/wds/subj0{args.target_subject}/train/" + "{0.." + f"{args.train_sessions-1}" + "}.tar"
-    train_data = wds.WebDataset(train_url, resampled=True, nodesplitter=my_split_by_node) \
-        .shuffle(750, initial=1500, rng=random.Random(args.seed)) \
-        .decode("torch") \
-        .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
-        .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
-    train_dl = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, drop_last=True, pin_memory=True)
+        # Validation dataloader (last M sessions)
+        val_start = nsessions_allsubj[s] - args.val_sessions
+        val_url = f"{args.data_path}/wds/subj0{s}/train/" + "{" + f"{val_start}.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
+        val_data[f'subj0{s}'] = wds.WebDataset(val_url, resampled=False, nodesplitter=my_split_by_node) \
+            .decode("torch") \
+            .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
+            .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
+        val_dl[f'subj0{s}'] = torch.utils.data.DataLoader(val_data[f'subj0{s}'], batch_size=train_batch_size, shuffle=False, drop_last=True, pin_memory=True)
 
-    # Validation dataloader (last M sessions)
-    val_start = nsessions_allsubj[args.target_subject] - args.val_sessions
-    val_url = f"{args.data_path}/wds/subj0{args.target_subject}/train/" + "{" + f"{val_start}.." + f"{nsessions_allsubj[args.target_subject]-1}" + "}.tar"
-    val_data = wds.WebDataset(val_url, resampled=False, nodesplitter=my_split_by_node) \
-        .decode("torch") \
-        .rename(behav="behav.npy") \
-        .to_tuple("behav")
-    val_dl = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size, shuffle=False, drop_last=True, pin_memory=True)
-    accelerator.print(f"Loaded validation data with {750 * args.val_sessions} samples.")
-
-    # Load target subject's voxel data
-    with h5py.File(f'{args.data_path}/betas_all_subj0{args.target_subject}_fp32_renorm.hdf5', 'r') as f:
-        voxels = torch.from_numpy(f['betas'][:]).to("cpu").to(torch.float16)
-    accelerator.print(f"Loaded {voxels.shape[1]} voxels for target subject {args.target_subject}")
+        # Load voxel data
+        with h5py.File(f'{args.data_path}/betas_all_subj0{s}_fp32_renorm.hdf5', 'r') as f:
+            betas = torch.from_numpy(f['betas'][:]).to("cpu").to(torch.float16)
+        num_voxels_list.append(betas.shape[1])
+        num_voxels[f'subj0{s}'] = betas.shape[1]
+        voxels[f'subj0{s}'] = betas
+        accelerator.print(f"Loaded training data and {num_voxels[f'subj0{s}']} voxels for subj0{s}")
     
     # Load all 73k COCO images
     with h5py.File(f'{args.data_path}/coco_images_224_float16.hdf5', 'r') as f:
@@ -245,7 +219,7 @@ def main():
 
     local_vae_path = f'{args.cache_dir}/sd-vae-ft-mse'
     local_clip_path = f'{args.cache_dir}/CLIP_L/open_clip_pytorch_model.bin'
-    
+
     # CLIP Image Encoder
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
         arch="ViT-L-14", 
@@ -256,11 +230,9 @@ def main():
     clip_seq_dim = 256
     clip_emb_dim = 1024
 
-    # Main MindEye model (will be loaded from pretrained)
+    # Main MindEye model
     model = MindEyeModule()
-    
-    # Initialize with dummy ridge (will be replaced when loading pretrained)
-    model.ridge = RidgeRegression([1000], out_features=args.hidden_dim)  # Dummy
+    model.ridge = RidgeRegression(num_voxels_list, out_features=args.hidden_dim)
     model.backbone = BrainNetwork(
         h=args.hidden_dim, in_dim=args.hidden_dim, seq_len=1, n_blocks=args.n_blocks,
         clip_size=clip_emb_dim, out_dim=clip_emb_dim * clip_seq_dim,
@@ -277,9 +249,6 @@ def main():
             net=prior_network, image_embed_dim=clip_emb_dim,
             condition_on_text_encodings=False, text_cond_drop_prob=0.2
         )
-
-    # Load pretrained model and get target ridge index
-    target_ridge_idx = load_pretrained_model(model, args.pretrained_model, args.target_subject, accelerator)
 
     # Models for Blurry Reconstruction
     autoenc, cnx = None, None
@@ -320,14 +289,18 @@ def main():
         )
 
     # --- Prepare everything with Accelerator ---
-    model, optimizer, train_dl_prepared, val_dl_prepared, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dl, val_dl, lr_scheduler
+    train_dls_prepared = [train_dl[f'subj0{s}'] for s in args.train_subjects]
+    val_dls_prepared = [val_dl[f'subj0{s}'] for s in args.train_subjects]
+    
+    model, optimizer, *train_dls_prepared, lr_scheduler = accelerator.prepare(
+        model, optimizer, *train_dls_prepared, lr_scheduler
     )
+    val_dls_prepared = [accelerator.prepare(val_dl) for val_dl in val_dls_prepared]
     
     # --- Weights & Biases Logging ---
     if accelerator.is_main_process and args.wandb_log:
         import wandb
-        wandb_config = {**vars(args), "global_batch_size": global_batch_size, "target_ridge_idx": target_ridge_idx}
+        wandb_config = {**vars(args), "global_batch_size": global_batch_size}
         wandb.init(
             project=args.wandb_project,
             name=args.model_name,
@@ -336,7 +309,7 @@ def main():
         )
 
     # --- Training Loop ---
-    accelerator.print(f"\n--- Starting fine-tuning for subject {args.target_subject} ---")
+    accelerator.print(f"\n--- Starting shared backbone pretraining ---")
     progress_bar = tqdm(range(args.num_epochs), disable=not accelerator.is_main_process)
     
     mse = nn.MSELoss()
@@ -353,33 +326,34 @@ def main():
         # --- Pre-load all batches for the epoch for speed ---
         voxel_iters, perm_iters, betas_iters, select_iters = {}, {}, {}, {}
         skipped_iterations = set()
-        image_iters = torch.zeros(num_iterations_per_epoch, batch_size, 3, 224, 224, dtype=torch.float16)
+        image_iters = torch.zeros(num_iterations_per_epoch, global_batch_size, 3, 224, 224, dtype=torch.float16)
 
-        train_dl_iter = iter(train_dl_prepared)
-        for i in range(num_iterations_per_epoch):
-            behav, _, _, _ = next(train_dl_iter)
-            
-            # Image data
-            img_indices = behav[:,0,0].cpu().long().numpy()
-            unique_indices, sorted_idx = np.unique(img_indices, return_index=True)
-            if len(unique_indices) != len(img_indices): 
-                skipped_iterations.add(i)
-                continue
-            
-            image_batch = torch.from_numpy(images[unique_indices]).to(torch.float16)
-            image_iters[i] = image_batch
-            
-            # Voxel data
-            voxel_indices = behav[:,0,5].cpu().long().numpy()[sorted_idx]
-            voxel_batch = voxels[voxel_indices].unsqueeze(1)
-            
-            if epoch < int(args.mixup_pct * args.num_epochs):
-                voxel_batch, perm, betas, select = utils.mixco(voxel_batch)
-                perm_iters[f"i{i}"] = perm
-                betas_iters[f"i{i}"] = betas
-                select_iters[f"i{i}"] = select
+        for s_idx, s in enumerate(args.train_subjects):
+            train_dl_iter = iter(train_dls_prepared[s_idx])
+            for i in range(num_iterations_per_epoch):
+                behav, _, _, _ = next(train_dl_iter)
+                
+                # Image data
+                img_indices = behav[:,0,0].cpu().long().numpy()
+                unique_indices, sorted_idx = np.unique(img_indices, return_index=True)
+                if len(unique_indices) != len(img_indices): 
+                    skipped_iterations.add(i)
+                    continue
+                
+                image_batch = torch.from_numpy(images[unique_indices]).to(torch.float16)
+                image_iters[i, s_idx*train_batch_size:(s_idx+1)*train_batch_size] = image_batch
+                
+                # Voxel data
+                voxel_indices = behav[:,0,5].cpu().long().numpy()[sorted_idx]
+                voxel_batch = voxels[f'subj0{s}'][voxel_indices].unsqueeze(1)
+                
+                if epoch < int(args.mixup_pct * args.num_epochs):
+                    voxel_batch, perm, betas, select = utils.mixco(voxel_batch)
+                    perm_iters[f"s{s}_i{i}"] = perm
+                    betas_iters[f"s{s}_i{i}"] = betas
+                    select_iters[f"s{s}_i{i}"] = select
 
-            voxel_iters[f"i{i}"] = voxel_batch
+                voxel_iters[f"s{s}_i{i}"] = voxel_batch
 
         # --- Train on pre-loaded batches ---
         epoch_loss = 0
@@ -390,8 +364,8 @@ def main():
                 continue
             optimizer.zero_grad()
             
-            # Get data for this iteration
-            voxel_batch = voxel_iters[f"i{i}"].to(device)
+            # Collate data from all subjects for the current iteration
+            voxel_list = [voxel_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
             image_batch = image_iters[i].to(device)
             
             if args.use_image_aug:
@@ -403,12 +377,15 @@ def main():
                 
                 # BiMixCo logic for early epochs
                 if epoch < int(args.mixup_pct * args.num_epochs):
-                    perm = perm_iters[f"i{i}"].to(device)
-                    betas = betas_iters[f"i{i}"].to(device)
-                    select = select_iters[f"i{i}"].to(device)
-            
+                    perm_list = [perm_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
+                    betas_list = [betas_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
+                    select_list = [select_iters[f"s{s}_i{i}"].to(device) for s in args.train_subjects]
+                    perm, betas, select = torch.cat(perm_list), torch.cat(betas_list), torch.cat(select_list)
+
                 # Forward pass through target subject's ridge layer
-                voxel_ridge = model.ridge(voxel_batch, target_ridge_idx)
+                voxel_ridge_list = [model.ridge(voxel_list[s_idx], s_idx) for s_idx, s in enumerate(args.train_subjects)]
+                voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
+                
                 backbone_features, clip_voxels, blurry_image_enc = model.backbone(voxel_ridge)
                 
                 # --- Calculate Losses ---
@@ -464,67 +441,70 @@ def main():
             # Collect embeddings for retrieval evaluation
             all_val_brain_embeds = []
             all_val_image_embeds = []
-
+            
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-                val_dl_iter = iter(val_dl_prepared)
-                # Sample a fixed number of batches for validation
-                max_val_batches = 20  # Limit validation batches per subject
-                val_batch_count = 0
-
-                while val_batch_count < max_val_batches:
-                    try:
-                        val_behav= next(val_dl_iter)[0]
-                        val_batch_count += 1
-                    except StopIteration:
-                        # No more batches available for this subject
-                        break
+                # Evaluate on validation sets from all training subjects
+                for s_idx, s in enumerate(args.train_subjects):
+                    val_dl_iter = iter(val_dls_prepared[s_idx])
+                    
+                    # Sample a fixed number of batches for validation
+                    max_val_batches = 20  # Limit validation batches per subject
+                    val_batch_count = 0
+                    
+                    while val_batch_count < max_val_batches:
+                        try:
+                            val_behav, _, _, _ = next(val_dl_iter)
+                            val_batch_count += 1
+                        except StopIteration:
+                            # No more batches available for this subject
+                            break
+                            
+                        # Process validation batch
+                        val_img_indices = val_behav[:,0,0].cpu().long().numpy()
+                        val_unique_indices, val_sorted_idx = np.unique(val_img_indices, return_index=True)
+                        if len(val_unique_indices) != len(val_img_indices):
+                            continue
+                            
+                        val_image_batch = torch.from_numpy(images[val_unique_indices]).to(torch.float16).to(device)
+                        val_voxel_indices = val_behav[:,0,5].cpu().long().numpy()[val_sorted_idx]
+                        val_voxel_batch = voxels[f'subj0{s}'][val_voxel_indices].unsqueeze(1).to(device)
                         
-                    # Process validation batch
-                    val_img_indices = val_behav[:,0,0].cpu().long().numpy()
-                    val_unique_indices, val_sorted_idx = np.unique(val_img_indices, return_index=True)
-                    if len(val_unique_indices) != len(val_img_indices):
-                        continue
+                        # Forward pass
+                        val_clip_target = clip_img_embedder(val_image_batch)
+                        val_voxel_ridge = accelerator.unwrap_model(model).ridge(val_voxel_batch, s_idx)
+                        _, val_clip_voxels, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
                         
-                    val_image_batch = torch.from_numpy(images[val_unique_indices]).to(torch.float16).to(device)
-                    val_voxel_indices = val_behav[:,0,5].cpu().long().numpy()[val_sorted_idx]
-                    val_voxel_batch = voxels[val_voxel_indices].unsqueeze(1).to(device)
-                    
-                    # Forward pass
-                    val_clip_target = clip_img_embedder(val_image_batch)
-                    val_voxel_ridge = accelerator.unwrap_model(model).ridge(val_voxel_batch, target_ridge_idx)
-                    _, val_clip_voxels, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
-                    
-                    # Calculate validation metrics
-                    val_clip_voxels_norm = nn.functional.normalize(val_clip_voxels.flatten(1), dim=-1)
-                    val_clip_target_norm = nn.functional.normalize(val_clip_target.flatten(1), dim=-1)
+                        # Calculate validation metrics
+                        val_clip_voxels_norm = nn.functional.normalize(val_clip_voxels.flatten(1), dim=-1)
+                        val_clip_target_norm = nn.functional.normalize(val_clip_target.flatten(1), dim=-1)
 
-                    # Collect embeddings for retrieval evaluation
-                    all_val_brain_embeds.append(val_clip_voxels_norm.cpu())
-                    all_val_image_embeds.append(val_clip_target_norm.cpu())
-                    
-                    val_loss_clip = utils.soft_clip_loss(val_clip_voxels_norm, val_clip_target_norm, temp=0.006)
-                    val_loss += (args.clip_scale * val_loss_clip).item()
-                    
-                    # Add prior validation loss
-                    if args.use_prior:
-                        val_backbone_features, _, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
-                        val_loss_prior, _ = accelerator.unwrap_model(model).rectified_flow(text_embed=val_backbone_features, image_embed=val_clip_target)
-                        val_loss += (args.prior_scale * val_loss_prior).item()
+                        # Collect embeddings for retrieval evaluation
+                        all_val_brain_embeds.append(val_clip_voxels_norm.cpu())
+                        all_val_image_embeds.append(val_clip_target_norm.cpu())
+                        
+                        val_loss_clip = utils.soft_clip_loss(val_clip_voxels_norm, val_clip_target_norm, temp=0.006)
+                        val_loss += (args.clip_scale * val_loss_clip).item()
+                        
+                        # Add prior validation loss
+                        if args.use_prior:
+                            val_backbone_features, _, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
+                            val_loss_prior, _ = accelerator.unwrap_model(model).rectified_flow(text_embed=val_backbone_features, image_embed=val_clip_target)
+                            val_loss += (args.prior_scale * val_loss_prior).item()
 
-                        # Test rectified flow generation quality
-                        generated_embeddings = accelerator.unwrap_model(model).rectified_flow.sample(
-                            text_embed=val_backbone_features[:5], 
-                            num_steps=20
-                        )
-                        gen_similarity = torch.nn.functional.cosine_similarity(
-                            generated_embeddings.flatten(1), 
-                            val_clip_target[:5].flatten(1), 
-                            dim=-1
-                        ).mean()
-                        val_gen_similarity += gen_similarity.item()
+                            # Test rectified flow generation quality
+                            generated_embeddings = accelerator.unwrap_model(model).rectified_flow.sample(
+                                text_embed=val_backbone_features[:5], 
+                                num_steps=20
+                            )
+                            gen_similarity = torch.nn.functional.cosine_similarity(
+                                generated_embeddings.flatten(1), 
+                                val_clip_target[:5].flatten(1), 
+                                dim=-1
+                            ).mean()
+                            val_gen_similarity += gen_similarity.item()
 
-                    val_batches += 1
-                
+                        val_batches += 1
+
                 # Compute retrieval metrics on accumulated embeddings
                 if len(all_val_brain_embeds) > 0:
                     # Concatenate all collected embeddings
@@ -542,15 +522,16 @@ def main():
                         accelerator.print(f"Skipping retrieval evaluation - only {len(all_brain_embeds)} samples available")
                         val_fwd_acc = 0.0
                         val_bwd_acc = 0.0
-            
+                        
+            # logging metrics for WandB
             logs = {
                 "epoch": epoch,
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
-            # Training losses
-            logs["train/loss"] = epoch_loss / num_batches if num_batches > 0 else 0
-            
+            # Training total loss and individual loss components
+            logs["train/total_loss"] = epoch_loss / num_batches if num_batches > 0 else 0
+
             if args.use_prior:
                 logs["train/prior_loss"] = epoch_prior_loss / num_batches if num_batches > 0 else 0
                 logs["train/prior_loss_scaled"] = (args.prior_scale * epoch_prior_loss / num_batches) if num_batches > 0 else 0
@@ -561,25 +542,24 @@ def main():
             if args.blurry_recon:
                 logs["train/blur_loss"] = epoch_blur_loss / num_batches if num_batches > 0 else 0
                 logs["train/blur_loss_scaled"] = (args.blur_scale * epoch_blur_loss / num_batches) if num_batches > 0 else 0
+            
+            if args.use_prior:
+                logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss)
+            logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss)
+            if args.blurry_recon:
+                logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss)
 
-            # Validation metrics
+            # Validation metrics: total loss, generation similarity, retrieval accuracy
             logs.update({
-                "val/total_loss": val_loss,
+                "val/total_loss": val_loss / val_batches if val_batches > 0 else 0,
                 "val/fwd_acc": val_fwd_acc,
                 "val/bwd_acc": val_bwd_acc,
             })
-
             if args.use_prior:
-                logs["val/prior_generation_similarity"] = val_gen_similarity/num_batches if num_batches > 0 else 0
+                logs["val/prior_generation_similarity"] = val_gen_similarity / val_batches if val_batches > 0 else 0
 
-            # Loss ratios for monitoring balance
-            if epoch_loss > 0:
-                if args.use_prior:
-                    logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss)
-                logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss)
-                if args.blurry_recon:
-                    logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss)
-
+            
+            
             progress_bar.set_postfix(**logs)
             if args.wandb_log:
                 wandb.log(logs)
@@ -588,21 +568,21 @@ def main():
         if args.ckpt_saving and (epoch % args.ckpt_interval == 0 or epoch == args.num_epochs - 1):
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
-                save_path = os.path.join(outdir, f'finetuned_subj0{args.target_subject}_last.pth')
+                save_path = os.path.join(outdir, 'last.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': unwrapped_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
-                    'target_subject': args.target_subject,
-                    'target_ridge_idx': target_ridge_idx,
+                    'train_subjects': args.train_subjects,
+                    'num_voxels_list': num_voxels_list,
                     'args': vars(args)
                 }, save_path)
                 accelerator.print(f"\n--- Saved checkpoint at {save_path} ---")
 
         accelerator.wait_for_everyone()
     
-    accelerator.print(f"\n=== Fine-tuning for subject {args.target_subject} finished! ===")
+    accelerator.print("\n=== Shared Backbone Pretraining Finished! ===")
     if args.wandb_log and accelerator.is_main_process:
         wandb.finish()
 
