@@ -228,7 +228,7 @@ def main():
         .rename(behav="behav.npy") \
         .to_tuple("behav")
     val_dl = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size, shuffle=False, drop_last=True, pin_memory=True)
-    accelerator.print(f"Loaded validation data with {len(val_dl)} samples.")
+    accelerator.print(f"Loaded validation data with {750 * args.val_sessions} samples.")
 
     # Load target subject's voxel data
     with h5py.File(f'{args.data_path}/betas_all_subj0{args.target_subject}_fp32_renorm.hdf5', 'r') as f:
@@ -321,7 +321,7 @@ def main():
 
     # --- Prepare everything with Accelerator ---
     model, optimizer, train_dl_prepared, val_dl_prepared, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dl_prepared, val_dl, lr_scheduler
+        model, optimizer, train_dl, val_dl, lr_scheduler
     )
     
     # --- Weights & Biases Logging ---
@@ -355,7 +355,7 @@ def main():
         skipped_iterations = set()
         image_iters = torch.zeros(num_iterations_per_epoch, batch_size, 3, 224, 224, dtype=torch.float16)
 
-        train_dl_iter = iter(train_dl)
+        train_dl_iter = iter(train_dl_prepared)
         for i in range(num_iterations_per_epoch):
             behav, _, _, _ = next(train_dl_iter)
             
@@ -473,7 +473,7 @@ def main():
 
                 while val_batch_count < max_val_batches:
                     try:
-                        val_behav, _, _, _ = next(val_dl_iter)
+                        val_behav= next(val_dl_iter)[0]
                         val_batch_count += 1
                     except StopIteration:
                         # No more batches available for this subject
@@ -487,11 +487,11 @@ def main():
                         
                     val_image_batch = torch.from_numpy(images[val_unique_indices]).to(torch.float16).to(device)
                     val_voxel_indices = val_behav[:,0,5].cpu().long().numpy()[val_sorted_idx]
-                    val_voxel_batch = voxels[f'subj0{s}'][val_voxel_indices].unsqueeze(1).to(device)
+                    val_voxel_batch = voxels[val_voxel_indices].unsqueeze(1).to(device)
                     
                     # Forward pass
                     val_clip_target = clip_img_embedder(val_image_batch)
-                    val_voxel_ridge = accelerator.unwrap_model(model).ridge(val_voxel_batch, s_idx)
+                    val_voxel_ridge = accelerator.unwrap_model(model).ridge(val_voxel_batch, target_ridge_idx)
                     _, val_clip_voxels, _ = accelerator.unwrap_model(model).backbone(val_voxel_ridge)
                     
                     # Calculate validation metrics
@@ -564,29 +564,20 @@ def main():
 
             # Validation metrics
             logs.update({
-                "val/total_loss": val_total_loss,
-                "val/clip_loss": val_loss_clip.item(),
+                "val/total_loss": val_loss,
                 "val/fwd_acc": val_fwd_acc,
                 "val/bwd_acc": val_bwd_acc,
             })
-            
-            if args.use_prior:
-                logs["val/prior_loss"] = val_prior_loss
-            if args.blurry_recon:
-                logs["val/blur_loss"] = val_blur_loss
 
             if args.use_prior:
-                logs["val/prior_loss"] = val_prior_loss
                 logs["val/prior_generation_similarity"] = val_gen_similarity
-            if args.blurry_recon:
-                logs["val/blur_loss"] = val_blur_loss
 
             # Loss ratios for monitoring balance
             if args.use_prior:
-                logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss).item()
-            logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss).item()
+                logs["train/prior_ratio"] = (args.prior_scale * epoch_prior_loss / epoch_loss)
+            logs["train/clip_ratio"] = (args.clip_scale * epoch_clip_loss / epoch_loss)
             if args.blurry_recon:
-                logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss).item()
+                logs["train/blur_ratio"] = (args.blur_scale * epoch_blur_loss / epoch_loss)
 
             progress_bar.set_postfix(**logs)
             if args.wandb_log:

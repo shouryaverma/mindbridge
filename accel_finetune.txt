@@ -1,7 +1,12 @@
 sinteractive -A pccr -N 1 -p ai -q preemptible -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
+# for Gilbreth
+sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=120G -t 48:00:00 
+
 
 # finetune on subj01, debug
-accelerate launch syn_fine_single.py \
+accelerate launch --num_processes=$((1 * 1)) \
+    --num_machines=1 \
+    --mixed_precision=fp16 syn_fine_single.py \
     --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
     --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
     --pretrained_model=/depot/natallah/data/shourya/mindbridge/MindEyeV2/train_logs/debug_shared_smallModel_subsetSessions/shared_backbone_last.pth \
@@ -17,4 +22,4 @@ accelerate launch syn_fine_single.py \
     --ckpt_interval=2 \
     --seed=42 \
     --wandb_log \
-    --wandb_project='mindbridge-pretraining'
+    --wandb_project='mindbridge'

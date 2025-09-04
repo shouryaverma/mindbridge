@@ -183,28 +183,22 @@ def main():
     accelerator.print(f"Iterations per epoch: {num_iterations_per_epoch}")
 
     for s in args.train_subjects:
-        # Training data (first N sessions)
+        # Training dataloader (first N sessions)
         train_url = f"{args.data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
-        
-        # Validation data (last M sessions)
-        val_start = nsessions_allsubj[s] - args.val_sessions
-        val_url = f"{args.data_path}/wds/subj0{s}/train/" + "{" + f"{val_start}.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
-
-        # Training dataloader
         train_data[f'subj0{s}'] = wds.WebDataset(train_url, resampled=True, nodesplitter=my_split_by_node) \
             .shuffle(750, initial=1500, rng=random.Random(args.seed)) \
             .decode("torch") \
             .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
             .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
-        
         train_dl[f'subj0{s}'] = torch.utils.data.DataLoader(train_data[f'subj0{s}'], batch_size=train_batch_size, shuffle=False, drop_last=True, pin_memory=True)
 
-        # Validation dataloader
+        # Validation dataloader (last M sessions)
+        val_start = nsessions_allsubj[s] - args.val_sessions
+        val_url = f"{args.data_path}/wds/subj0{s}/train/" + "{" + f"{val_start}.." + f"{nsessions_allsubj[s]-1}" + "}.tar"
         val_data[f'subj0{s}'] = wds.WebDataset(val_url, resampled=False, nodesplitter=my_split_by_node) \
             .decode("torch") \
             .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy") \
             .to_tuple("behav", "past_behav", "future_behav", "olds_behav")
-        
         val_dl[f'subj0{s}'] = torch.utils.data.DataLoader(val_data[f'subj0{s}'], batch_size=train_batch_size, shuffle=False, drop_last=True, pin_memory=True)
 
         # Load voxel data
