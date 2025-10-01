@@ -42,6 +42,7 @@ model:
             params:
               layer: hidden
               layer_idx: 11
+              version: /depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41
 
           - is_trainable: False
             input_key: txt

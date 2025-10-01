@@ -2,10 +2,12 @@ wandb/
 train_logs/
 slurms/
 datasets/
-src/cache/
+src/cache
 inference_outputs/
 wandb.txt
-
+src/evals
+/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
+/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache/CLIP_L
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

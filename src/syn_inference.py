@@ -398,7 +398,7 @@ def setup_unclip_engine(cache_dir, device):
         raise e
 
 def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_image_indices, 
-                           voxels, device, args, autoenc, processor, clip_text_model, clip_convert,
+                           voxels, images,device, args, autoenc, processor, clip_text_model, clip_convert,
                            diffusion_engine, vector_suffix):
     """Generate reconstructions from fMRI data."""
     model.eval()
@@ -407,6 +407,8 @@ def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_i
     all_blurry_recons = []
     all_pred_captions = []
     all_clip_voxels = []
+    all_backbones = []     
+    all_prior_out = [] 
     
     unique_image_indices = np.unique(test_image_indices)
     
@@ -457,6 +459,7 @@ def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_i
             
             # Store retrieval outputs
             all_clip_voxels.append(clip_voxels.cpu())
+            all_backbones.append(backbone_features.cpu()) 
             
             # Generate samples using Rectified Flow
             prior_samples_1024 = model.rectified_flow.sample(
@@ -464,6 +467,7 @@ def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_i
                 num_steps=args.num_inference_steps,
                 cond_scale=args.cond_scale
             )
+            all_prior_out.append(prior_samples_1024.cpu())
 
             # Text Generation directly with OpenCLIP ViT/L embeddings
             if clip_convert is not None:
@@ -476,7 +480,7 @@ def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_i
                     print(f"Direct CLIP L text generation failed: {e}")
                     all_pred_captions.extend(["" for _ in range(len(batch_imgs))])
             else:
-                print("Using CLIP converter")
+                print("Not using CLIP converter, skipping text generation")
                 all_pred_captions.extend(["" for _ in range(len(batch_imgs))])
 
             # Generate actual images via unCLIP (before refining)
@@ -493,13 +497,15 @@ def generate_reconstructions(model, target_ridge_idx, test_voxel_indices, test_i
     # Concatenate results
     all_recons = torch.cat(all_recons, dim=0)
     all_clip_voxels = torch.cat(all_clip_voxels, dim=0)
+    all_backbones = torch.cat(all_backbones, dim=0)
+    all_prior_out = torch.cat(all_prior_out, dim=0)
     
     if args.blurry_recon:
         all_blurry_recons = torch.cat(all_blurry_recons, dim=0)
     else:
         all_blurry_recons = None
     
-    return all_recons, all_blurry_recons, all_clip_voxels, all_pred_captions
+    return all_recons, all_blurry_recons, all_clip_voxels, all_pred_captions, all_backbones, all_prior_out
 
 
 def main():
@@ -537,7 +543,7 @@ def main():
     diffusion_engine, vector_suffix = setup_unclip_engine(args.cache_dir, device)
     
     # Generate reconstructions
-    all_recons, all_blurry_recons, all_clip_voxels, all_pred_captions = generate_reconstructions(
+    all_recons, all_blurry_recons, all_clip_voxels, all_pred_captions, all_backbones, all_prior_out = generate_reconstructions(
         model, target_ridge_idx, test_voxel_indices, test_image_indices, 
         voxels, images, device, args, autoenc, processor, clip_text_model, clip_convert,
         diffusion_engine, vector_suffix)
@@ -551,6 +557,8 @@ def main():
     torch.save(all_recons, f"{output_dir}/{args.model_name}_all_recons.pt")
     torch.save(all_clip_voxels, f"{output_dir}/{args.model_name}_all_clipvoxels.pt")
     torch.save(all_pred_captions, f"{output_dir}/{args.model_name}_all_predcaptions.pt")
+    torch.save(all_backbones, f"{output_dir}/{args.model_name}_all_backbones.pt")
+    torch.save(all_prior_out, f"{output_dir}/{args.model_name}_all_prior_out.pt")
     
     if all_blurry_recons is not None:
         all_blurry_recons = transforms.Resize((imsize, imsize))(all_blurry_recons).float()

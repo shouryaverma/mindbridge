@@ -1,7 +1,7 @@
 # for Gautschi
 sinteractive -A pccr -N 1 -p ai -q preemptible -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
 # for Gilbreth
-sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=120G -t 48:00:00 
+sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=165G -t 4:00:00 
 
 
 
@@ -12,3 +12,21 @@ python syn_inference.py \
     --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
     --hidden_dim=64 \
     --n_blocks=2
+
+python syn_enhanced_inference.py \
+    --model_name=debug_finetune_smallModel_subsetSessions \
+    --target_subject=1 \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --num_samples_to_enhance=50 \
+    --enhancement_strength=0.6
+
+python syn_enhanced_inference_new.py \
+    --model_name=debug_finetune_smallModel_subsetSessions \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
+
+python syn_final_eval.py \
+    --model_name=debug_finetune_smallModel_subsetSessions \
+    --subj=1 \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --use_enhanced
