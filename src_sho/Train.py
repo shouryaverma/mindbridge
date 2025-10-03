@@ -315,12 +315,11 @@ if use_bidirectional:
 # Diffusion prior
 if use_prior:
     from models import *
-
     out_dim = clip_emb_dim
     depth = 6
     dim_head = 52
     heads = clip_emb_dim // 52
-    timesteps = 100
+    sampling_timesteps = 10  # Much fewer steps needed for rectified flow
 
     prior_network = PriorNetwork(
         dim=out_dim,
@@ -332,16 +331,15 @@ if use_prior:
         learned_query_mode="pos_emb"
     )
 
-    model.diffusion_prior = BrainDiffusionPrior(
+    model.rectified_flow = BrainRectifiedFlow(
         net=prior_network,
         image_embed_dim=out_dim,
         condition_on_text_encodings=False,
-        timesteps=timesteps,
         cond_drop_prob=0.2,
-        image_embed_scale=None,
+        sampling_timesteps=sampling_timesteps,
     )
 
-    utils.count_params(model.diffusion_prior)
+    utils.count_params(model.rectified_flow)
     utils.count_params(model)
 
 # Optimizer
@@ -355,8 +353,8 @@ opt_grouped_parameters = [
 
 if use_prior:
     opt_grouped_parameters.extend([
-        {'params': [p for n, p in model.diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
-        {'params': [p for n, p in model.diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        {'params': [p for n, p in model.rectified_flow.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+        {'params': [p for n, p in model.rectified_flow.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ])
 
 if use_bidirectional:
@@ -577,7 +575,7 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
                 if use_prior:
-                    loss_prior, prior_out = model.diffusion_prior(text_embed=backbone, image_embed=clip_target)
+                    loss_prior, prior_out = model.rectified_flow(text_embed=backbone, image_embed=clip_target)
                     loss_prior_total += loss_prior.item()
                     loss_prior *= prior_scale
                     loss += loss_prior
@@ -663,7 +661,7 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
                 if use_prior:
-                    loss_prior, prior_out = model.diffusion_prior(text_embed=backbone, image_embed=clip_target)
+                    loss_prior, prior_out = model.rectified_flow(text_embed=backbone, image_embed=clip_target)
                     loss_prior_total += loss_prior.item()
                     loss_prior *= prior_scale
                     loss += loss_prior
@@ -807,7 +805,7 @@ for epoch in progress_bar:
                 random_samps = np.random.choice(np.arange(len(image)), size=len(image) // 5, replace=False)
 
                 if use_prior:
-                    loss_prior, contaminated_prior_out = model.diffusion_prior(
+                    loss_prior, contaminated_prior_out = model.rectified_flow(
                         text_embed=backbone[random_samps], 
                         image_embed=clip_target[random_samps]
                     )

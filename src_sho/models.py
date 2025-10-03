@@ -858,3 +858,184 @@ class ImageToFMRIMapper(nn.Module):
         h_fmri = self.fmri_projector(h_pooled)
         voxels_pred = self.output_heads[subj_idx](h_fmri)
         return voxels_pred
+
+class RectifiedFlow(nn.Module):
+    def __init__(
+        self,
+        net,
+        image_embed_dim,
+        condition_on_text_encodings=False,
+        cond_drop_prob=0.0,
+        sampling_timesteps=10,
+    ):
+        super().__init__()
+        self.net = net
+        self.image_embed_dim = image_embed_dim
+        self.condition_on_text_encodings = condition_on_text_encodings
+        self.cond_drop_prob = cond_drop_prob
+        self.sampling_timesteps = sampling_timesteps
+
+    def compute_flow_loss(self, x0, x1, text_cond):
+        """
+        Compute rectified flow loss
+        x0: noise (initial point)
+        x1: target embedding (end point)
+        text_cond: conditioning information
+        """
+        batch_size = x1.shape[0]
+        device = x1.device
+        
+        # Sample timesteps uniformly from [0, 1]
+        t = torch.rand(batch_size, device=device)
+        
+        # Interpolate between x0 and x1
+        x_t = t.view(-1, 1, 1) * x1 + (1 - t.view(-1, 1, 1)) * x0
+        
+        # Target velocity is the straight line from x0 to x1
+        v_target = x1 - x0
+        
+        # Predict velocity
+        v_pred = self.net(
+            x_t,
+            t,
+            text_cond_drop_prob=self.cond_drop_prob if self.training else 0.0,
+            **text_cond
+        )
+        
+        # Compute MSE loss
+        loss = nn.functional.mse_loss(v_pred, v_target)
+        
+        return loss, v_pred
+
+    @torch.no_grad()
+    def sample(self, text_cond, batch_size, num_steps=None, generator=None):
+        """
+        Sample using Euler ODE integration
+        """
+        if num_steps is None:
+            num_steps = self.sampling_timesteps
+            
+        device = next(self.net.parameters()).device
+        
+        # Start from random noise
+        if generator is None:
+            x = torch.randn(batch_size, self.net.num_tokens, self.image_embed_dim, device=device)
+        else:
+            x = torch.randn(batch_size, self.net.num_tokens, self.image_embed_dim, 
+                          device=device, generator=generator)
+        
+        dt = 1.0 / num_steps
+        
+        # Euler integration from t=0 to t=1
+        for step in range(num_steps):
+            t = torch.ones(batch_size, device=device) * (step / num_steps)
+            
+            # Predict velocity at current point
+            v = self.net(
+                x,
+                t,
+                text_cond_drop_prob=0.0,
+                **text_cond
+            )
+            
+            # Euler step
+            x = x + v * dt
+        
+        return x
+
+    @torch.no_grad()
+    def sample_rk4(self, text_cond, batch_size, num_steps=None, generator=None):
+        """
+        Sample using 4th order Runge-Kutta integration (more accurate but slower)
+        """
+        if num_steps is None:
+            num_steps = self.sampling_timesteps
+            
+        device = next(self.net.parameters()).device
+        
+        if generator is None:
+            x = torch.randn(batch_size, self.net.num_tokens, self.image_embed_dim, device=device)
+        else:
+            x = torch.randn(batch_size, self.net.num_tokens, self.image_embed_dim, 
+                          device=device, generator=generator)
+        
+        dt = 1.0 / num_steps
+        
+        for step in range(num_steps):
+            t = step / num_steps
+            t_batch = torch.ones(batch_size, device=device) * t
+            t_mid = torch.ones(batch_size, device=device) * (t + dt/2)
+            t_next = torch.ones(batch_size, device=device) * (t + dt)
+            
+            # RK4 integration
+            k1 = self.net(x, t_batch, text_cond_drop_prob=0.0, **text_cond)
+            k2 = self.net(x + 0.5 * dt * k1, t_mid, text_cond_drop_prob=0.0, **text_cond)
+            k3 = self.net(x + 0.5 * dt * k2, t_mid, text_cond_drop_prob=0.0, **text_cond)
+            k4 = self.net(x + dt * k3, t_next, text_cond_drop_prob=0.0, **text_cond)
+            
+            x = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        
+        return x
+
+
+class BrainRectifiedFlow(RectifiedFlow):
+    """
+    Rectified flow for brain-to-image translation
+    Similar interface to BrainDiffusionPrior but uses rectified flow
+    """
+    def __init__(self, *args, **kwargs):
+        voxel2clip = kwargs.pop('voxel2clip', None)
+        super().__init__(*args, **kwargs)
+        self.voxel2clip = voxel2clip
+
+    def forward(
+        self,
+        text=None,
+        image=None,
+        voxel=None,
+        text_embed=None,
+        image_embed=None,
+        text_encodings=None,
+        *args,
+        **kwargs
+    ):
+        assert exists(text) ^ exists(text_embed) ^ exists(voxel), \
+            'either text, text embedding, or voxel must be supplied'
+        assert exists(image) ^ exists(image_embed), \
+            'either image or image embedding must be supplied'
+        assert not (self.condition_on_text_encodings and 
+                   (not exists(text_encodings) and not exists(text))), \
+            'text encodings must be present if you specified you wish to condition on it'
+
+        if exists(voxel):
+            assert exists(self.voxel2clip), 'voxel2clip must be provided'
+            assert not exists(text_embed), 'cannot pass in both text and voxels'
+            if self.voxel2clip.use_projector:
+                clip_voxels_mse, clip_voxels = self.voxel2clip(voxel)
+                text_embed = clip_voxels_mse
+            else:
+                clip_voxels = self.voxel2clip(voxel)
+                text_embed = clip_voxels_mse = clip_voxels
+
+        if exists(image):
+            image_embed, _ = self.clip.embed_image(image)
+
+        if exists(text):
+            text_embed, text_encodings = self.clip.embed_text(text)
+
+        text_cond = dict(text_embed=text_embed)
+
+        if self.condition_on_text_encodings:
+            assert exists(text_encodings), 'text encodings must be present'
+            text_cond = {**text_cond, 'text_encodings': text_encodings}
+
+        batch_size = image_embed.shape[0]
+        device = image_embed.device
+        
+        # Sample initial noise point
+        x0 = torch.randn_like(image_embed)
+        
+        # Compute rectified flow loss
+        loss, pred = self.compute_flow_loss(x0, image_embed, text_cond)
+        
+        return loss, pred
