@@ -1,14 +1,18 @@
-# for Gilbreth
-sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=120G -t 48:00:00 
-# for Gautschi
-sinteractive -A pccr -N 1 -p ai -q preemptible -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
+Gilbreth
 
+sinteractive -A pccr -N 1 -p a10 -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mem=165G --mail-user=lu1202@purdue.edu --mail-type=FAIL
+
+Gautschi
+
+sinteractive -A pccr -N 1 -p ai -q preemptible -t 6:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
+
+export HF_HOME=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
 
 
 # shared backbone debug: smallmodel 4 sessions wandb-logged withBlurryRecon
 accelerate launch --num_processes=$((1 * 1)) \
     --num_machines=1 \
-    --mixed_precision=fp16 syn_train_shared.py \
+    --mixed_precision=fp16 Train_roy.py \
     --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
     --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
     --model_name=debug_shared_smallModel_subsetSessions \
@@ -55,5 +59,52 @@ accelerate launch --num_processes=$((1 * 1)) \
     --mixup_pct=0.33 \
     --ckpt_saving \
     --ckpt_interval = 10 \
+    --wandb_log \
+    --wandb_project='mindbridge'
+
+####################################################################################################
+################### Unified Model ##################################################################
+####################################################################################################
+
+# unified model shared backbone debug: small model
+accelerate launch --num_processes=$((1 * 1)) \
+    --num_machines=1 \
+    --mixed_precision=fp16 Train_roy.py \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --model_name=debug_unified_shared_smallModel_subSessions \
+    --multi_subject \
+    --subj=1 \
+    --batch_size=21 \
+    --num_epochs=10 \
+    --num_sessions=4 \
+    --hidden_dim=64 \
+    --n_blocks=2 \
+    --use_prior \
+    --blurry_recon \
+    --ckpt_saving \
+    --ckpt_interval=2 \
+    --seed=42 \
+    --wandb_log \
+    --wandb_project='mindbridge'
+
+
+# unified model shared backbone full training
+accelerate launch --num_processes=$((1 * 1)) \
+    --num_machines=1 \
+    --mixed_precision=fp16 Train_roy.py \
+    --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
+    --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
+    --model_name=unified_shared_fullModel_allSessions \
+    --multi_subject \
+    --subj=1 \
+    --batch_size=21 \
+    --num_epochs=150 \
+    --num_sessions=40 \
+    --use_prior \
+    --blurry_recon \
+    --ckpt_saving \
+    --ckpt_interval=10 \
+    --seed=42 \
     --wandb_log \
     --wandb_project='mindbridge'

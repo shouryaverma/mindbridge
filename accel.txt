@@ -1,3 +1,13 @@
+Gilbreth
+
+sinteractive -A pccr -N 1 -p a10 -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mem=165G --mail-user=lu1202@purdue.edu --mail-type=FAIL
+
+Gautschi
+
+sinteractive -A pccr -N 1 -p ai -q preemptible -t 6:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
+
+export HF_HOME=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
+
 accelerate launch --num_processes=$(($NUM_GPUS * $COUNT_NODE)) \
 --num_machines=$COUNT_NODE --main_process_ip=$MASTER_ADDR \
 --main_process_port=$MASTER_PORT --mixed_precision=fp16 train_rect.py \
