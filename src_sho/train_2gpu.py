@@ -128,9 +128,9 @@ else:
 
 print("subj_list", subj_list, "num_sessions", num_sessions)
 
-# Data loader setup
-def my_split_by_node(urls):
-    return urls
+# # Data loader setup - loading same batch of data across nodes
+# def my_split_by_node(urls):
+#     return urls
 
 num_voxels_list = []
 
@@ -160,11 +160,14 @@ for s in subj_list:
         train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{num_sessions-1}" + "}.tar"
     print(train_url)
 
-    train_data[f'subj0{s}'] = wds.WebDataset(train_url, resampled=True, nodesplitter=my_split_by_node)\
-                        .shuffle(750, initial=1500, rng=random.Random(42))\
-                        .decode("torch")\
-                        .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy")\
-                        .to_tuple(*["behav", "past_behav", "future_behav", "olds_behav"])
+    # train_data[f'subj0{s}'] = wds.WebDataset(train_url, 
+    #                                         resampled=True, 
+    #                                         nodesplitter=my_split_by_node)\
+    train_data[f'subj0{s}'] = wds.WebDataset(train_url, resampled=True)\
+                                .shuffle(750, initial=1500, rng=random.Random(42))\
+                                .decode("torch")\
+                                .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy")\
+                                .to_tuple(*["behav", "past_behav", "future_behav", "olds_behav"])
     train_dl[f'subj0{s}'] = torch.utils.data.DataLoader(train_data[f'subj0{s}'], 
                                                         batch_size=batch_size, 
                                                         shuffle=False, 
@@ -227,9 +230,16 @@ elif new_test:
     num_test = num_test_dict[test_subj]
     test_url = f"{data_path}/wds/subj0{test_subj}/new_test/0.tar"
 
+# Nodesplitter for test data: only rank 0 gets data
+def split_by_rank_for_test(urls):
+    """Only rank 0 gets the data, other ranks get nothing."""
+    rank = int(os.getenv('RANK', 0))
+    return urls if rank == 0 else []
+
 print(test_url)
 print(f"Testing on subject {test_subj} with {num_test} samples")
-test_data = wds.WebDataset(test_url, resampled=False, nodesplitter=my_split_by_node)\
+# test_data = wds.WebDataset(test_url, resampled=False, nodesplitter=my_split_by_node)\
+test_data = wds.WebDataset(test_url, resampled=False, nodesplitter=split_by_rank_for_test)\
                     .shuffle(750, initial=1500, rng=random.Random(42))\
                     .decode("torch")\
                     .rename(behav="behav.npy", past_behav="past_behav.npy", future_behav="future_behav.npy", olds_behav="olds_behav.npy")\
