@@ -3,6 +3,7 @@ train_logs/
 slurms/
 datasets/
 src/cache
+src_sho/slurms/
 inference_outputs/
 wandb.txt
 src/evals

@@ -1,6 +1,7 @@
 Gilbreth
 
-sinteractive -A pccr -N 1 -p a10 -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mem=165G --mail-user=lu1202@purdue.edu --mail-type=FAIL
+sinteractive -A pccr -N 1 -p a10 -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mem=165G 
+--mail-user=lu1202@purdue.edu --mail-type=FAIL
 
 Gautschi
 

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 from accelerate import Accelerator
-from models_roy import *
+from models import *
 
 sys.path.append('./generative_models')
 import sgm
@@ -335,7 +335,7 @@ if use_bidirectional:
 
 # Rectified Flow Matching Prior
 if use_prior:
-    from models_roy import *
+    from models import *
     out_dim = clip_emb_dim
     depth = 6
     dim_head = 52

@@ -131,10 +131,11 @@ accelerate launch --num_processes=$((1 * 1)) \
 --ckpt_interval=2 \
 --no-wandb_log
 
-# for Gilbreth
-sinteractive -A pccr -p a10 -N1 -n1 --gpus-per-node=1 --cpus-per-task=28 --mem=165G -t 48:00:00 
+Gilbreth
 
-# for Gautschi
-sinteractive -A pccr -p ai -N1 -n1 --gpus-per-node=1 --cpus-per-task=14 --mem=165G -t 48:00:00
+sinteractive -A pccr -N 1 -p a10 -t 4:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mem=165G --mail-user=lu1202@purdue.edu --mail-type=FAIL
 
+Gautschi
+
+sinteractive -A pccr -N 1 -p ai -q preemptible -t 6:00:00 --gpus-per-node=1 --cpus-per-gpu=14 --mail-user=lu1202@purdue.edu --mail-type=FAIL
 

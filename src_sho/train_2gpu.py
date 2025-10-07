@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 from accelerate import Accelerator
-from models_roy import *
+from models import *
 
 sys.path.append('./generative_models')
 import sgm
@@ -335,7 +335,7 @@ if use_bidirectional:
 
 # Rectified Flow Matching Prior
 if use_prior:
-    from models_roy import *
+    from models import *
     out_dim = clip_emb_dim
     depth = 6
     dim_head = 52
@@ -510,25 +510,33 @@ if os.path.exists(checkpoint_path):
     # test_losses = checkpoint.get('test_losses', [])
     # lrs = checkpoint.get('lrs', [])
     # del checkpoint
-    print(f"Found checkpoint at {checkpoint_path}, resuming...")
+    print(f"Found checkpoint at {checkpoint_path}, will resume after prepare...")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     losses = checkpoint.get('train_losses', [])
     test_losses = checkpoint.get('test_losses', [])
     lrs = checkpoint.get('lrs', [])
     epoch = checkpoint['epoch']
-    print(f"Loaded checkpoint from epoch {epoch}")
+    print(f"Will load checkpoint from epoch {epoch}")
     del checkpoint
+    resume_from_checkpoint = True
+    load_multisubj = False
 elif multisubject_ckpt is not None:
-    # Load pretrained multisubject model if starting fresh
-    load_ckpt("last", outdir=multisubject_ckpt, load_lr=False, load_optimizer=False, 
-              load_epoch=False, strict=False, multisubj_loading=True)
+    # # Load pretrained multisubject model if starting fresh
+    # load_ckpt("last", outdir=multisubject_ckpt, load_lr=False, load_optimizer=False, 
+    #           load_epoch=False, strict=False, multisubj_loading=True)
+    # epoch = 0
+    # losses, test_losses, lrs = [], [], []
+    print("Will load pretrained multisubject model after prepare...")
     epoch = 0
     losses, test_losses, lrs = [], [], []
+    resume_from_checkpoint = False
+    load_multisubj = True
 else:
     print("No checkpoint found, starting from scratch")
     epoch = 0
     losses, test_losses, lrs = [], [], []
+    resume_from_checkpoint = False
+    load_multisubj = False
 
 #model, optimizer, *train_dls, lr_scheduler = accelerator.prepare(model, optimizer, *train_dls, lr_scheduler)
 # WebDataset's nodesplitter function already handles multi-GPU data distribution, 
@@ -539,9 +547,19 @@ model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_schedu
 # Load optimizer and scheduler states AFTER prepare (they handle DDP correctly)
 if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'], strict=True)
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
     del checkpoint
+    print(f"Successfully resumed from checkpoint at epoch {epoch}")
+elif load_multisubj:
+    # Load pretrained multisubject model
+    checkpoint = torch.load(f'{multisubject_ckpt}/last.pth', map_location='cpu')
+    state_dict = checkpoint['model_state_dict']
+    state_dict.pop('ridge.linears.0.weight', None)  # Remove subject-specific ridge
+    accelerator.unwrap_model(model).load_state_dict(state_dict, strict=False)
+    del checkpoint
+    print("Successfully loaded pretrained multisubject model")
 
 best_test_loss = 1e9
 print(f"{model_name} starting with epoch {epoch} / {num_epochs}")
@@ -550,6 +568,11 @@ test_image, test_voxel = None, None
 mse = nn.MSELoss()
 l1 = nn.L1Loss()
 soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
+
+
+# Add this helper to avoid typing .module everywhere # for multi-GPU
+m = accelerator.unwrap_model(model)
+
 
 for epoch in progress_bar:
     model.train()
@@ -634,19 +657,19 @@ for epoch in progress_bar:
                 select_list = [select_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
                 select = torch.cat(select_list, dim=0)
 
-            voxel_ridge_list = [model.ridge(voxel_list[si], si) for si, s in enumerate(subj_list)]
+            voxel_ridge_list = [m.ridge(voxel_list[si], si) for si, s in enumerate(subj_list)]
             voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
 
             if use_bidirectional:
                 # === FORWARD PATH: fMRI → Image ===
-                backbone, clip_voxels, blurry_image_enc_ = model.backbone(voxel_ridge)
+                backbone, clip_voxels, blurry_image_enc_ = m.backbone(voxel_ridge)
 
                 if clip_scale > 0:
                     clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
                 if use_prior:
-                    loss_prior, prior_out = model.rectified_flow(text_embed=backbone, image_embed=clip_target)
+                    loss_prior, prior_out = m.rectified_flow(text_embed=backbone, image_embed=clip_target)
                     loss_prior_total += loss_prior.item()
                     loss_prior *= prior_scale
                     loss += loss_prior
@@ -726,7 +749,7 @@ for epoch in progress_bar:
                 loss_fmri_recon = 0.0
                 for si, s in enumerate(subj_list):
                     batch_clip = clip_target[si*batch_size:(si+1)*batch_size]
-                    voxel_pred = model.image_to_fmri(batch_clip, si)
+                    voxel_pred = m.image_to_fmri(batch_clip, si)
                     voxel_orig = voxel_list[si][:, 0, :]  # Get original voxels for this subject
                     
                     # Compute loss per subject
@@ -739,14 +762,14 @@ for epoch in progress_bar:
                 
             else:
                 # === ORIGINAL PATH (keep everything as-is) ===
-                backbone, clip_voxels, blurry_image_enc_ = model.backbone(voxel_ridge)
+                backbone, clip_voxels, blurry_image_enc_ = m.backbone(voxel_ridge)
 
                 if clip_scale > 0:
                     clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
                 if use_prior:
-                    loss_prior, prior_out = model.rectified_flow(text_embed=backbone, image_embed=clip_target)
+                    loss_prior, prior_out = m.rectified_flow(text_embed=backbone, image_embed=clip_target)
                     loss_prior_total += loss_prior.item()
                     loss_prior *= prior_scale
                     loss += loss_prior
@@ -854,8 +877,8 @@ for epoch in progress_bar:
                     # Find the correct ridge index for test_subj
                     test_subj_ridge_idx = list(subj_list).index(test_subj)
                     for rep in range(3):
-                        voxel_ridge = model.ridge(voxel[:, rep], test_subj_ridge_idx)
-                        backbone0, clip_voxels0, blurry_image_enc_ = model.backbone(voxel_ridge)
+                        voxel_ridge = m.ridge(voxel[:, rep], test_subj_ridge_idx)
+                        backbone0, clip_voxels0, blurry_image_enc_ = m.backbone(voxel_ridge)
                         if rep == 0:
                             clip_voxels = clip_voxels0
                             backbone = backbone0
@@ -869,7 +892,7 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
                     
                     # Reverse: Image → fMRI
-                    voxel_pred = model.image_to_fmri(clip_target[:60], 0)
+                    voxel_pred = m.image_to_fmri(clip_target[:60], 0)
                     voxel_orig = voxel[:60, 0, 0, :]
                     loss_fmri_recon = mse(voxel_pred, voxel_orig)
                     test_loss_fmri_recon_total += loss_fmri_recon.item()
@@ -878,8 +901,8 @@ for epoch in progress_bar:
                 else:
                     # Original path
                     for rep in range(3):
-                        voxel_ridge = model.ridge(voxel[:, rep], 0)
-                        backbone0, clip_voxels0, blurry_image_enc_ = model.backbone(voxel_ridge)
+                        voxel_ridge = m.ridge(voxel[:, rep], 0)
+                        backbone0, clip_voxels0, blurry_image_enc_ = m.backbone(voxel_ridge)
                         if rep == 0:
                             clip_voxels = clip_voxels0
                             backbone = backbone0
@@ -895,7 +918,7 @@ for epoch in progress_bar:
                 random_samps = np.random.choice(np.arange(len(image)), size=len(image) // 5, replace=False)
 
                 if use_prior:
-                    loss_prior, contaminated_prior_out = model.rectified_flow(
+                    loss_prior, contaminated_prior_out = m.rectified_flow(
                         text_embed=backbone[random_samps], 
                         image_embed=clip_target[random_samps]
                     )
