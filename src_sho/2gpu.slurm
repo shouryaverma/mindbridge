@@ -16,7 +16,7 @@ export HF_HOME=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
 
 accelerate launch --num_processes=$((2 * 1)) \
     --main_process_port=0 \
-    --mixed_precision=fp16 train_2gpu.py \
+    --mixed_precision=fp16 train_multigpu.py \
     --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
     --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \
     --model_name=debug_fullModel_2gpu_multiSubj_batch14 \

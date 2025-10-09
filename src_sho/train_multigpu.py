@@ -39,7 +39,7 @@ import utils
 # else:
 #     local_rank = int(local_rank)
 # print("LOCAL RANK ", local_rank)
-# use accelerator.is_main_process() instead of local_rank == 0 to handle distributed training
+# use accelerator.is_main_process instead of local_rank == 0 to handle distributed training
 
 data_type = torch.float16
 num_devices = torch.cuda.device_count()
@@ -452,7 +452,7 @@ print("\nDone with model preparations!")
 num_params = utils.count_params(model)
 
 # Wandb
-if accelerator.is_main_process() and wandb_log:
+if accelerator.is_main_process and wandb_log:
     import wandb
     wandb_project = 'mindbridge'
     print(f"wandb {wandb_project} run {model_name}")
@@ -574,7 +574,7 @@ elif load_multisubj:
 
 best_test_loss = 1e9
 print(f"{model_name} starting with epoch {epoch} / {num_epochs}")
-progress_bar = tqdm(range(epoch, num_epochs), ncols=1200, disable=not accelerator.is_main_process())
+progress_bar = tqdm(range(epoch, num_epochs), ncols=1200, disable=not accelerator.is_main_process)
 test_image, test_voxel = None, None
 mse = nn.MSELoss()
 l1 = nn.L1Loss()
@@ -846,7 +846,7 @@ for epoch in progress_bar:
                 lr_scheduler.step()
 
     model.eval()
-    if accelerator.is_main_process():
+    if accelerator.is_main_process:
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=data_type):
             for test_i, (behav, past_behav, future_behav, old_behav) in enumerate(test_dl):
                 assert len(behav) == num_test
