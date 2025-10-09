@@ -21,7 +21,7 @@ export HF_HOME=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
 # Distributed Training Configuration
 # ============================================
 export NUM_GPUS=3  # Must match --gpus-per-node
-export BATCH_SIZE=28
+export BATCH_SIZE=56 # larger batch to solve NaN loss instability issue
 export GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
 
 # Generate random port to avoid conflicts with other jobs
@@ -57,7 +57,7 @@ accelerate launch \
     --num_machines=$COUNT_NODE \
     --main_process_ip=$MASTER_ADDR \
     --main_process_port=$MASTER_PORT \
-    --mixed_precision=fp16 \
+    --mixed_precision=bf16 \
     train_multigpu.py \
     --data_path=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/datasets \
     --cache_dir=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache \

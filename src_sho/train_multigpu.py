@@ -97,7 +97,7 @@ parser.add_argument("--use_bidirectional", action=argparse.BooleanOptionalAction
 parser.add_argument("--kl_scale", type=float, default=0.001)
 parser.add_argument("--cycle_scale", type=float, default=0.5)
 parser.add_argument("--align_scale", type=float, default=1.0)
-parser.add_argument("--fmri_recon_scale", type=float, default=1.0)
+parser.add_argument("--fmri_recon_scale", type=float, default=0.5)
 
 args = parser.parse_args()
 
@@ -836,6 +836,7 @@ for epoch in progress_bar:
 
             # Common for both paths
             utils.check_loss(loss)
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0) #Gradient clipping to prevent gradient explosion NaN loss
             accelerator.backward(loss)
             optimizer.step()
 
@@ -936,6 +937,11 @@ for epoch in progress_bar:
                     test_loss_prior_total += loss_prior.item()
                     loss_prior *= prior_scale
                     loss += loss_prior
+
+                    test_recon_cossim += nn.functional.cosine_similarity(
+                        prior_out, clip_target[random_samps]
+                    ).mean().item()
+                    test_recon_mse += mse(prior_out, clip_target[random_samps]).item()
 
                 if clip_scale > 0:
                     loss_clip = utils.soft_clip_loss(
