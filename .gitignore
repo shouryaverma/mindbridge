@@ -4,6 +4,8 @@ slurms/
 datasets/
 src/cache
 src_sho/slurms/
+roy_src/autoencoder/
+roy_src/generative_models
 inference_outputs/
 wandb.txt
 src/evals
