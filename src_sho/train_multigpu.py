@@ -46,7 +46,8 @@ num_devices = torch.cuda.device_count()
 if num_devices == 0:
     num_devices = 1
 
-accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
+# accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
+accelerator = Accelerator(split_batches=False) # let mixed_precision be handled by the flag
 global_batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE", 8))
 batch_size = global_batch_size // num_devices
 
@@ -80,7 +81,7 @@ parser.add_argument("--mixup_pct", type=float, default=.33, help="proportion of 
 parser.add_argument("--blurry_recon", action=argparse.BooleanOptionalAction, default=True, help="whether to output blurry reconstructions")
 parser.add_argument("--blur_scale", type=float, default=.5, help="multiply loss from blurry recons by this number")
 parser.add_argument("--clip_scale", type=float, default=1., help="multiply contrastive loss by this number")
-parser.add_argument("--prior_scale", type=float, default=30, help="multiply diffusion prior loss by this")
+parser.add_argument("--prior_scale", type=float, default=10, help="multiply diffusion prior loss by this")
 parser.add_argument("--use_image_aug", action=argparse.BooleanOptionalAction, default=False, help="whether to use image augmentation")
 parser.add_argument("--num_epochs", type=int, default=150, help="number of epochs of training")
 parser.add_argument("--multi_subject", action=argparse.BooleanOptionalAction, default=False)
@@ -97,7 +98,7 @@ parser.add_argument("--use_bidirectional", action=argparse.BooleanOptionalAction
 parser.add_argument("--kl_scale", type=float, default=0.001)
 parser.add_argument("--cycle_scale", type=float, default=0.5)
 parser.add_argument("--align_scale", type=float, default=1.0)
-parser.add_argument("--fmri_recon_scale", type=float, default=0.5)
+parser.add_argument("--fmri_recon_scale", type=float, default=0.05)
 
 args = parser.parse_args()
 
@@ -129,6 +130,10 @@ else:
 
 print("subj_list", subj_list, "num_sessions", num_sessions)
 
+#==========================================
+# Data Loader + Image + Pre-trained Models
+#==========================================
+
 # # Data loader setup - loading same batch of data across nodes
 # def my_split_by_node(urls):
 #     return urls
@@ -153,12 +158,23 @@ train_dl = {}
 num_voxels = {}
 voxels = {}
 
+# for s in subj_list:
+#     print(f"Training with {num_sessions} sessions")
+#     if multi_subject:
+#         train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s-1]-1}" + "}.tar"
+#     else:
+#         train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{num_sessions-1}" + "}.tar"
+#     print(train_url)
+
 for s in subj_list:
-    print(f"Training with {num_sessions} sessions")
     if multi_subject:
-        train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{nsessions_allsubj[s-1]-1}" + "}.tar"
+        actual_sessions = nsessions_allsubj[s-1]
+        train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{actual_sessions-1}" + "}.tar"
     else:
+        actual_sessions = num_sessions
         train_url = f"{data_path}/wds/subj0{s}/train/" + "{0.." + f"{num_sessions-1}" + "}.tar"
+    # fix the issue of printing num_sessions instead of actual_sessions for multiSubj
+    print(f"Training with {actual_sessions} sessions for subj0{s}")
     print(train_url)
 
     # train_data[f'subj0{s}'] = wds.WebDataset(train_url, 
@@ -186,6 +202,86 @@ for s in subj_list:
     print(f"num_voxels for subj0{s}: {num_voxels[f'subj0{s}']}")
 
 print("Loaded all subj train dls and betas!\n")
+
+# === Dynamically clamp outputs to reasonable range ===
+# ==========================================
+print("Computing global voxel statistics for dynamic clamping...")
+all_voxel_values = []
+for s in subj_list:
+    voxel_data = voxels[f'subj0{s}']
+    num_samples = len(voxel_data)
+    
+    # ✅ FIX: Sample much more aggressively to avoid memory issues
+    # Take only 500 random samples per subject (not 10% of all data)
+    sample_size = min(500, num_samples)
+    sample_indices = torch.randperm(num_samples)[:sample_size]
+    sampled_voxels = voxel_data[sample_indices].flatten()
+    
+    # Further subsample the flattened voxels if still too large
+    # Each sample has ~14k voxels, so 500 samples = 7M values per subject
+    # We'll take only 100k values per subject max
+    if len(sampled_voxels) > 100000:
+        subsample_indices = torch.randperm(len(sampled_voxels))[:100000]
+        sampled_voxels = sampled_voxels[subsample_indices]
+    
+    all_voxel_values.append(sampled_voxels)
+    print(f"  Sampled {len(sampled_voxels)} voxel values from subj0{s}")
+
+all_voxels = torch.cat(all_voxel_values)
+print(f"Total sampled voxel values: {len(all_voxels):,}")
+
+# Convert to float32 for statistical computations
+all_voxels = all_voxels.float()
+
+# Compute statistics
+voxel_mean = all_voxels.mean().item()
+voxel_std = all_voxels.std().item()
+voxel_min = all_voxels.min().item()
+voxel_max = all_voxels.max().item()
+
+# Compute clamping range using mean ± 5σ (covers ~99.7% of data)
+voxel_clamp_min = voxel_mean - 5 * voxel_std
+voxel_clamp_max = voxel_mean + 5 * voxel_std
+
+# Compute percentiles on a smaller sample if still too large
+if len(all_voxels) > 10_000_000:  # 10M threshold
+    print(f"  Subsampling for percentile computation (tensor too large)...")
+    percentile_sample_size = 1_000_000
+    percentile_indices = torch.randperm(len(all_voxels))[:percentile_sample_size]
+    percentile_sample = all_voxels[percentile_indices]
+    voxel_p01 = torch.quantile(percentile_sample, 0.01).item()
+    voxel_p99 = torch.quantile(percentile_sample, 0.99).item()
+else:
+    voxel_p01 = torch.quantile(all_voxels, 0.01).item()
+    voxel_p99 = torch.quantile(all_voxels, 0.99).item()
+
+print(f"\nVoxel Statistics (across {len(subj_list)} subjects):")
+print(f"  Absolute range: [{voxel_min:.4f}, {voxel_max:.4f}]")
+print(f"  Mean: {voxel_mean:.4f}, Std: {voxel_std:.4f}")
+print(f"  5σ clamp range: [{voxel_clamp_min:.4f}, {voxel_clamp_max:.4f}]")
+print(f"  1st-99th percentile: [{voxel_p01:.4f}, {voxel_p99:.4f}]")
+
+# Choose which clamping method to use
+# Option 1: 5σ (recommended - more conservative)
+VOXEL_CLAMP_MIN = voxel_clamp_min
+VOXEL_CLAMP_MAX = voxel_clamp_max
+
+# Option 2: Percentile-based (uncomment to use instead)
+# VOXEL_CLAMP_MIN = voxel_p01
+# VOXEL_CLAMP_MAX = voxel_p99
+
+print(f"\nUsing clamp range: [{VOXEL_CLAMP_MIN:.4f}, {VOXEL_CLAMP_MAX:.4f}]")
+
+# Estimate coverage
+within_range = ((all_voxels >= VOXEL_CLAMP_MIN) & (all_voxels <= VOXEL_CLAMP_MAX)).sum()
+coverage = 100.0 * within_range / len(all_voxels)
+print(f"This range covers {coverage:.2f}% of sampled training voxel values\n")
+
+# Clean up to save memory
+del all_voxels, all_voxel_values
+
+# ==========================================
+
 
 # Test data loader
 # if multi_subject:
@@ -300,6 +396,10 @@ if blurry_recon:
         data_keys=["input"],
     )
 
+#==========================================
+# Model Preparations
+#==========================================
+
 # MindEye modules
 class MindEyeModule(nn.Module):
     def __init__(self):
@@ -340,6 +440,8 @@ if use_bidirectional:
         hidden_dim=4096,
         num_subjects=len(subj_list),
         voxel_sizes=[num_voxels[f'subj0{s}'] for s in subj_list]
+        # voxel_clamp_min=VOXEL_CLAMP_MIN,  # voxel clamp min
+        # voxel_clamp_max=VOXEL_CLAMP_MAX   # voxel clamp max
     )
     utils.count_params(model.image_to_fmri)
     utils.count_params(model)
@@ -451,7 +553,9 @@ def load_ckpt(tag, load_lr=True, load_optimizer=True, load_epoch=True, strict=Tr
 print("\nDone with model preparations!")
 num_params = utils.count_params(model)
 
+#==========================================
 # Wandb
+#==========================================
 if accelerator.is_main_process and wandb_log:
     import wandb
     wandb_project = 'mindbridge'
@@ -492,7 +596,9 @@ if accelerator.is_main_process and wandb_log:
 else:
     wandb_log = False
 
+#==========================================
 # Main training loop
+#==========================================
 
 # epoch = 0
 # losses, test_losses, lrs = [], [], []
@@ -676,8 +782,11 @@ for epoch in progress_bar:
                 backbone, clip_voxels, blurry_image_enc_ = m.backbone(voxel_ridge)
 
                 if clip_scale > 0:
-                    clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
-                    clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
+                    # clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
+                    # clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
+                    eps = 1e-8
+                    clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1) + eps, dim=-1)
+                    clip_target_norm = nn.functional.normalize(clip_target.flatten(1) + eps, dim=-1)
 
                 if use_prior:
                     loss_prior, prior_out = m.rectified_flow(text_embed=backbone, image_embed=clip_target)
@@ -758,26 +867,85 @@ for epoch in progress_bar:
                 # loss += loss_fmri_recon * fmri_recon_scale
                 # === REVERSE PATH: Image → fMRI ===
                 loss_fmri_recon = 0.0
+                
+                # Collect predictions for monitoring
+                all_voxel_preds = []
+                all_voxel_origs = []
+
                 for si, s in enumerate(subj_list):
                     batch_clip = clip_target[si*batch_size:(si+1)*batch_size]
                     voxel_pred = m.image_to_fmri(batch_clip, si)
                     voxel_orig = voxel_list[si][:, 0, :]  # Get original voxels for this subject
                     
+                    # Safety check
+                    if torch.isnan(voxel_pred).any():
+                        print(f"⚠️  WARNING: NaN in voxel_pred for subject {si} at step {train_i}!")
+                        voxel_pred = torch.nan_to_num(voxel_pred, nan=0.0)
+                    
                     # Compute loss per subject
-                    loss_fmri_recon += mse(voxel_pred, voxel_orig)
+                    subject_mse = mse(voxel_pred, voxel_orig)
+                    
+                    # Cap on individual subject loss to prevent one subject from exploding
+                    subject_mse = torch.clamp(subject_mse, max=10.0)
+                    
+                    loss_fmri_recon += subject_mse
+
+                    # Collect predictions for monitoring
+                    all_voxel_preds.append(voxel_pred)
+                    all_voxel_origs.append(voxel_orig)
 
                 # Average across subjects
                 loss_fmri_recon = loss_fmri_recon / len(subj_list)
                 loss_fmri_recon_total += loss_fmri_recon.item()
+
+                # POTENTIALLY REMOVE LATER! Check generated fmri recon to fix NaN fmri_recon loss
+                # === MONITORING: Print statistics every 50 steps ===
+                if train_i % 50 == 0:
+                    all_preds = torch.cat([p.flatten() for p in all_voxel_preds], dim=0)
+                    all_origs = torch.cat([p.flatten() for p in all_voxel_origs], dim=0)
+                    
+                    pred_min = all_preds.min().item()
+                    pred_max = all_preds.max().item()
+                    pred_mean = all_preds.mean().item()
+                    pred_std = all_preds.std().item()
+                    
+                    orig_min = all_origs.min().item()
+                    orig_max = all_origs.max().item()
+                    
+                    # Count how many predictions were clamped
+                    num_clamped_low = (all_preds <= VOXEL_CLAMP_MIN + 1e-6).sum().item()
+                    num_clamped_high = (all_preds >= VOXEL_CLAMP_MAX - 1e-6).sum().item()
+                    total_preds = all_preds.numel()
+                    pct_clamped = 100.0 * (num_clamped_low + num_clamped_high) / total_preds
+                    
+                    print(f"\n📊 Voxel Prediction Stats (Epoch {epoch}, Step {train_i}):")
+                    print(f"  Predicted: min={pred_min:.3f}, max={pred_max:.3f}, "
+                        f"mean={pred_mean:.3f}, std={pred_std:.3f}")
+                    print(f"  Original:  min={orig_min:.3f}, max={orig_max:.3f}")
+                    print(f"  Clamped: {num_clamped_low} low, {num_clamped_high} high "
+                        f"({pct_clamped:.2f}% total)")
+                    
+                    # Warning if too many predictions are clamped
+                    if pct_clamped > 5.0:
+                        print(f"  ⚠️  WARNING: {pct_clamped:.1f}% of predictions are being clamped!")
+                        print(f"     Consider adjusting fmri_recon_scale or model architecture")
+                    
+                    # Warning if predictions are exploding (even before clamp)
+                    if abs(pred_max) > 100 or abs(pred_min) > 100:
+                        print(f"  🚨 ALERT: Predictions are extreme before clamping!")
+
                 loss += loss_fmri_recon * fmri_recon_scale
                 
-            else:
+            else: # not bidirectional
                 # === ORIGINAL PATH (keep everything as-is) ===
                 backbone, clip_voxels, blurry_image_enc_ = m.backbone(voxel_ridge)
 
                 if clip_scale > 0:
-                    clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
-                    clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
+                    # clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
+                    # clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
+                    eps = 1e-8
+                    clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1) + eps, dim=-1)
+                    clip_target_norm = nn.functional.normalize(clip_target.flatten(1) + eps, dim=-1)
 
                 if use_prior:
                     loss_prior, prior_out = m.rectified_flow(text_embed=backbone, image_embed=clip_target)
@@ -820,7 +988,7 @@ for epoch in progress_bar:
                         nn.functional.normalize(cnx_aug_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
                         temp=0.2)
                     loss_blurry_cont_total += cont_loss.item()
-                    loss += (loss_blurry + 0.1 * cont_loss) * blur_scale
+                    loss += (loss_blurry + 0.05 * cont_loss) * blur_scale
 
                 if clip_scale > 0:
                     labels = torch.arange(len(clip_voxels_norm)).to(device)
@@ -834,10 +1002,38 @@ for epoch in progress_bar:
                         pixcorr = utils.pixcorr(image[random_samps], blurry_recon_images)
                         blurry_pixcorr += pixcorr.item()
 
+            # # debug nanLoss
+            # if train_i % 10 == 0 or torch.isnan(loss) or torch.isinf(loss):
+            #     print(f"\n=== Debug Step {train_i} ===")
+            #     print(f"Total loss: {loss.item()}")
+            #     if clip_scale > 0:
+            #         print(f"loss_clip: {loss_clip.item()}")
+            #         print(f"clip_voxels_norm stats: min={clip_voxels_norm.min()}, max={clip_voxels_norm.max()}, has_nan={torch.isnan(clip_voxels_norm).any()}")
+            #         print(f"clip_target_norm stats: min={clip_target_norm.min()}, max={clip_target_norm.max()}, has_nan={torch.isnan(clip_target_norm).any()}")
+            #     if use_prior:
+            #         print(f"loss_prior: {loss_prior.item()}")
+            #         print(f"prior_out has_nan: {torch.isnan(prior_out).any()}")
+            #     if blurry_recon:
+            #         print(f"loss_blurry: {loss_blurry.item()}")
+            #         print(f"cont_loss: {cont_loss.item()}")
+            #         print(f"transformer_feats has_nan: {torch.isnan(transformer_feats).any()}")
+            #     if use_bidirectional:
+            #         print(f"loss_fmri_recon: {loss_fmri_recon.item()}")
+            #         print(f"voxel_pred has_nan: {torch.isnan(voxel_pred).any()}")
+                
+            #     # Check gradients
+            #     for name, param in model.named_parameters():
+            #         if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+            #             print(f"NaN/Inf gradient in: {name}")
+                
+            #     if torch.isnan(loss) or torch.isinf(loss):
+            #         print("NaN/Inf detected! Stopping...")
+            #         import pdb; pdb.set_trace()
+                    
             # Common for both paths
             utils.check_loss(loss)
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0) #Gradient clipping to prevent gradient explosion NaN loss
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0) #Gradient clipping to prevent gradient explosion NaN loss
             optimizer.step()
 
             losses.append(loss.item())
@@ -904,7 +1100,8 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
                     
                     # Reverse: Image → fMRI
-                    voxel_pred = m.image_to_fmri(clip_target[:60], 0)
+                    test_subj_ridge_idx = list(subj_list).index(test_subj)
+                    voxel_pred = m.image_to_fmri(clip_target[:60], test_subj_ridge_idx)
                     voxel_orig = voxel[:60, 0, 0, :]
                     loss_fmri_recon = mse(voxel_pred, voxel_orig)
                     test_loss_fmri_recon_total += loss_fmri_recon.item()
@@ -939,9 +1136,9 @@ for epoch in progress_bar:
                     loss += loss_prior
 
                     test_recon_cossim += nn.functional.cosine_similarity(
-                        prior_out, clip_target[random_samps]
+                        contaminated_prior_out, clip_target[random_samps]
                     ).mean().item()
-                    test_recon_mse += mse(prior_out, clip_target[random_samps]).item()
+                    test_recon_mse += mse(contaminated_prior_out, clip_target[random_samps]).item()
 
                 if clip_scale > 0:
                     loss_clip = utils.soft_clip_loss(

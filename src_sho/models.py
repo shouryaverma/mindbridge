@@ -821,7 +821,12 @@ class GNet8_Encoder():
 class ImageToFMRIMapper(nn.Module):
     def __init__(self, clip_dim=1664, clip_tokens=256, hidden_dim=4096, 
                  num_subjects=1, voxel_sizes=None):
+                #  voxel_clamp_min=-5.0, voxel_clamp_max=5.0):
         super().__init__()
+
+        # # Store clamping values
+        # self.voxel_clamp_min = voxel_clamp_min
+        # self.voxel_clamp_max = voxel_clamp_max
         
         self.clip_processor = nn.Sequential(
             nn.LayerNorm(clip_dim),
@@ -850,14 +855,64 @@ class ImageToFMRIMapper(nn.Module):
             nn.Linear(hidden_dim * 2, voxel_sizes[i]) 
             for i in range(num_subjects)
         ])
+
+        # ==========================================
+        # Better Weight Initialization
+        # ==========================================
+        self._initialize_weights()
     
     def forward(self, clip_tokens, subj_idx):
+        # Add input validation
+        assert not torch.isnan(clip_tokens).any(), "clip_tokens has NaN"
+        assert not torch.isinf(clip_tokens).any(), "clip_tokens has Inf"
+
         h = self.clip_processor(clip_tokens)
+
+        # Check for explosions after processor
+        if torch.isnan(h).any() or torch.isinf(h).any():
+            print(f"NaN/Inf after clip_processor! Input stats: min={clip_tokens.min()}, max={clip_tokens.max()}")
+            h = torch.nan_to_num(h, nan=0.0, posinf=1e6, neginf=-1e6)
+
         h_attended, _ = self.token_attention(h, h, h)
+
+        # Check after attention
+        if torch.isnan(h_attended).any() or torch.isinf(h_attended).any():
+            print(f"NaN/Inf after attention!")
+            h_attended = torch.nan_to_num(h_attended, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         h_pooled = h_attended.mean(dim=1)
         h_fmri = self.fmri_projector(h_pooled)
+        
+        # Check before final projection
+        if torch.isnan(h_fmri).any() or torch.isinf(h_fmri).any():
+            print(f"NaN/Inf in h_fmri before output head!")
+            h_fmri = torch.nan_to_num(h_fmri, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         voxels_pred = self.output_heads[subj_idx](h_fmri)
+
+        # # Dynamically clamp outputs to reasonable range
+        # voxels_pred = torch.clamp(voxels_pred, 
+        #                            min=self.voxel_clamp_min, 
+        #                            max=self.voxel_clamp_max)
         return voxels_pred
+    
+    def _initialize_weights(self):
+        """Initialize weights with smaller variance to prevent explosions"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Use Xavier initialization with small gain
+                nn.init.xavier_normal_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+        
+        # Extra small initialization for output heads (they're large)
+        for head in self.output_heads:
+            nn.init.xavier_normal_(head.weight, gain=0.05)  # Very small!
+            if head.bias is not None:
+                nn.init.constant_(head.bias, 0.0)
 
 class RectifiedFlow(nn.Module):
     def __init__(

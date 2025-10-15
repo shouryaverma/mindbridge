@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=debug_multigpu
+#SBATCH --job-name=debug_nanloss
 #SBATCH --account=pccr
 #SBATCH --partition=ai
 #SBATCH --qos=preemptible
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=3
 #SBATCH --cpus-per-gpu=14
-#SBATCH --time=6:00:00
+#SBATCH --time=12:00:00
 #SBATCH -e slurms/%j.err
 #SBATCH -o slurms/%j.out
 #SBATCH --mail-user=lu1202@purdue.edu
@@ -21,7 +21,7 @@ export HF_HOME=/depot/natallah/data/shourya/mindbridge/MindEyeV2/src/cache
 # Distributed Training Configuration
 # ============================================
 export NUM_GPUS=3  # Must match --gpus-per-node
-export BATCH_SIZE=56 # larger batch to solve NaN loss instability issue
+export BATCH_SIZE=35 # larger batch to solve NaN loss instability issue - 35 is the sweet spot
 export GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
 
 # Generate random port to avoid conflicts with other jobs
@@ -50,7 +50,7 @@ echo "============================================"
 # ============================================
 # Launch Training
 # ============================================
-model_name="debug_fullModel_3gpu_multisubj_batch28"
+model_name="nan_fmri_recon_loss_attempt1(2)"
 echo model_name=${model_name}
 accelerate launch \
     --num_processes=$(($NUM_GPUS * $COUNT_NODE)) \
@@ -65,7 +65,7 @@ accelerate launch \
     --multi_subject \
     --subj=1 \
     --batch_size=${BATCH_SIZE} \
-    --num_epochs=150 \
+    --num_epochs=100 \
     --use_prior \
     --blurry_recon \
     --ckpt_saving \

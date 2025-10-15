@@ -307,6 +307,11 @@ def get_value(_x):
     return np.copy(_x.data.cpu().numpy())
 
 def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125):
+    # solve nanLoss issue
+    assert not torch.isnan(student_preds).any(), "student_preds has NaN"
+    assert not torch.isnan(teacher_preds).any(), "teacher_preds has NaN"
+    assert not torch.isnan(teacher_aug_preds).any(), "teacher_aug_preds has NaN"
+
     teacher_teacher_aug = (teacher_preds @ teacher_aug_preds.T)/temp
     teacher_teacher_aug_t = (teacher_aug_preds @ teacher_preds.T)/temp
     student_teacher_aug = (student_preds @ teacher_aug_preds.T)/temp
