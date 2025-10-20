@@ -63,6 +63,26 @@ print(accelerator.state)
 print("distributed =", distributed, "num_devices =", num_devices, "local rank =", local_rank, "world size =", world_size, "data_type =", data_type)
 print = accelerator.print
 
+def voxel_correlation(pred, target):
+    """
+    Compute average Pearson correlation across voxels
+    Args:
+        pred: (batch_size, num_voxels) predicted voxels
+        target: (batch_size, num_voxels) ground truth voxels
+    Returns:
+        mean correlation across all voxels
+    """
+    # Center the data (subtract mean across samples)
+    pred_centered = pred - pred.mean(dim=0, keepdim=True)
+    target_centered = target - target.mean(dim=0, keepdim=True)
+    
+    # Compute correlation per voxel
+    numerator = (pred_centered * target_centered).sum(dim=0)
+    denominator = (pred_centered.norm(dim=0) * target_centered.norm(dim=0)) + 1e-8
+    corr = numerator / denominator
+    
+    return corr.mean()
+
 # Argument parser
 parser = argparse.ArgumentParser(description="Model Training Configuration")
 parser.add_argument("--model_name", type=str, default="testing", help="name of model, used for ckpt saving and wandb logging")
@@ -302,14 +322,14 @@ utils.count_params(model.backbone)
 utils.count_params(model)
 
 if use_bidirectional:
-    model.image_to_fmri = ImageToFMRIMapper(
+    model.synbrain_mapper = SynBrainMapper(
         clip_dim=clip_emb_dim,
         clip_tokens=clip_seq_dim,
-        hidden_dim=4096,
+        latent_dim=4096,
         num_subjects=len(subj_list),
         voxel_sizes=[num_voxels[f'subj0{s}'] for s in subj_list]
     )
-    utils.count_params(model.image_to_fmri)
+    utils.count_params(model.synbrain_mapper)
     utils.count_params(model)
 
 # Diffusion prior
@@ -359,9 +379,9 @@ if use_prior:
 
 if use_bidirectional:
     opt_grouped_parameters.extend([
-        {'params': [p for n, p in model.image_to_fmri.named_parameters() 
+        {'params': [p for n, p in model.synbrain_mapper.named_parameters() 
                    if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
-        {'params': [p for n, p in model.image_to_fmri.named_parameters() 
+        {'params': [p for n, p in model.synbrain_mapper.named_parameters() 
                    if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
     ])
 
@@ -507,6 +527,20 @@ for epoch in progress_bar:
     loss_fmri_recon_total = 0.
     test_loss_fmri_recon_total = 0.
 
+    # ADD THESE:
+    loss_kl_total = 0.
+    loss_align_total = 0.
+    test_loss_kl_total = 0.
+    test_loss_align_total = 0.
+
+    loss_cycle_fb_total = 0.
+    loss_cycle_bf_total = 0.
+    test_loss_cycle_fb_total = 0.
+    test_loss_cycle_bf_total = 0.
+
+    voxel_corr_total = 0.
+    test_voxel_corr_total = 0.
+
     voxel_iters = {}
     image_iters = torch.zeros(num_iterations_per_epoch, batch_size * len(subj_list), 3, 224, 224).float()
     annot_iters = {}
@@ -640,17 +674,81 @@ for epoch in progress_bar:
 
                 # === REVERSE PATH: Image → fMRI ===
                 voxel_pred_list = []
+                mu_list = []
+                logvar_list = []
+                z_list = []
+
                 for si, s in enumerate(subj_list):
                     batch_clip = clip_target[si*batch_size:(si+1)*batch_size]
-                    voxel_pred = model.image_to_fmri(batch_clip, si)
+                    voxel_pred, mu, logvar, z = model.synbrain_mapper(batch_clip, si, return_distribution=True)
                     voxel_pred_list.append(voxel_pred)
-                
+                    mu_list.append(mu)
+                    logvar_list.append(logvar)
+                    z_list.append(z)
+
                 voxel_pred_all = torch.cat(voxel_pred_list, dim=0)
                 voxel_orig_all = torch.cat([voxel_list[si][:, 0, :] for si in range(len(subj_list))], dim=0)
-                
+                mu_all = torch.cat(mu_list, dim=0)
+                logvar_all = torch.cat(logvar_list, dim=0)
+                z_all = torch.cat(z_list, dim=0)
+
+                # Three-way loss for reverse path
+                # 1. Voxel reconstruction loss
                 loss_fmri_recon = mse(voxel_pred_all, voxel_orig_all)
                 loss_fmri_recon_total += loss_fmri_recon.item()
-                loss += loss_fmri_recon * fmri_recon_scale
+
+                # 2. KL divergence regularization
+                loss_kl = -0.5 * torch.mean(1 + logvar_all - mu_all.pow(2) - logvar_all.exp())
+                loss_kl_total += loss_kl.item()
+
+                # 3. CLIP alignment loss (align latent distribution center with CLIP)
+                loss_align = mse(mu_all.flatten(1), clip_target.flatten(1))
+                loss_align_total += loss_align.item()
+
+                # Combined reverse path loss
+                loss += (loss_fmri_recon * fmri_recon_scale + 
+                        loss_kl * kl_scale + 
+                        loss_align * align_scale)
+
+                # Forward-Backward Cycle: Image → fMRI → CLIP
+                # (Generate fMRI from CLIP, then reconstruct CLIP from that fMRI)
+                cycle_voxel_list = []
+                for si, s in enumerate(subj_list):
+                    batch_clip = clip_target[si*batch_size:(si+1)*batch_size]
+                    # Use deterministic mode (mu only) for cycle consistency
+                    voxel_from_clip = model.synbrain_mapper(batch_clip, si, return_distribution=False)
+                    cycle_voxel_list.append(voxel_from_clip)
+                
+                cycle_voxel_all = torch.cat(cycle_voxel_list, dim=0)
+                
+                # Pass through ridge and backbone to get back CLIP
+                cycle_voxel_ridge_list = [
+                    model.ridge(cycle_voxel_list[si].unsqueeze(1), si) 
+                    for si in range(len(subj_list))
+                ]
+                cycle_voxel_ridge = torch.cat(cycle_voxel_ridge_list, dim=0)
+                _, cycle_clip_reconstructed, _ = model.backbone(cycle_voxel_ridge)
+                
+                # Loss: reconstructed CLIP should match original CLIP
+                loss_cycle_fb = mse(cycle_clip_reconstructed.flatten(1), clip_target.flatten(1))
+                loss_cycle_fb_total += loss_cycle_fb.item()
+                loss += loss_cycle_fb * cycle_scale
+                
+                # Backward-Forward Cycle: fMRI → CLIP → fMRI
+                # (Generate CLIP from fMRI, then reconstruct fMRI from that CLIP)
+                roundtrip_voxel_list = []
+                for si, s in enumerate(subj_list):
+                    batch_clip_voxels = clip_voxels[si*batch_size:(si+1)*batch_size]
+                    # Use deterministic mode for cycle consistency
+                    voxel_roundtrip = model.synbrain_mapper(batch_clip_voxels, si, return_distribution=False)
+                    roundtrip_voxel_list.append(voxel_roundtrip)
+                
+                roundtrip_voxel_all = torch.cat(roundtrip_voxel_list, dim=0)
+                
+                # Loss: reconstructed voxels should match original voxels
+                loss_cycle_bf = mse(roundtrip_voxel_all, voxel_orig_all)
+                loss_cycle_bf_total += loss_cycle_bf.item()
+                loss += loss_cycle_bf * cycle_scale
                 
             else:
                 # === ORIGINAL PATH (keep everything as-is) ===
@@ -779,12 +877,43 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
                     
                     # Reverse: Image → fMRI
-                    voxel_pred = model.image_to_fmri(clip_target[:60], 0)
+                    voxel_pred, mu, logvar, z = model.synbrain_mapper(clip_target[:60], 0, return_distribution=True, deterministic=True)
                     voxel_orig = voxel[:60, 0, 0, :]
+
+                    # Three-way test loss
                     loss_fmri_recon = mse(voxel_pred, voxel_orig)
                     test_loss_fmri_recon_total += loss_fmri_recon.item()
-                    loss += loss_fmri_recon * fmri_recon_scale
+
+                    loss_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                    test_loss_kl_total += loss_kl.item()
+
+                    loss_align = mse(mu.flatten(1), clip_target[:60].flatten(1))
+                    test_loss_align_total += loss_align.item()
                     
+                    # ADD VOXEL CORRELATION:
+                    voxel_corr = voxel_correlation(voxel_pred, voxel_orig)
+                    test_voxel_corr_total += voxel_corr.item()
+
+                    loss += (loss_fmri_recon * fmri_recon_scale + 
+                            loss_kl * kl_scale + 
+                            loss_align * align_scale)
+                    
+                    # Forward-Backward Cycle
+                    test_cycle_voxel = model.synbrain_mapper(clip_target[:60], 0, return_distribution=False)
+                    test_cycle_voxel_ridge = model.ridge(test_cycle_voxel.unsqueeze(1), 0)
+                    _, test_cycle_clip_reconstructed, _ = model.backbone(test_cycle_voxel_ridge)
+                    
+                    loss_cycle_fb = mse(test_cycle_clip_reconstructed.flatten(1), clip_target[:60].flatten(1))
+                    test_loss_cycle_fb_total += loss_cycle_fb.item()
+                    loss += loss_cycle_fb * cycle_scale
+                    
+                    # Backward-Forward Cycle
+                    test_roundtrip_voxel = model.synbrain_mapper(clip_voxels[:60], 0, return_distribution=False)
+                    
+                    loss_cycle_bf = mse(test_roundtrip_voxel, voxel_orig)
+                    test_loss_cycle_bf_total += loss_cycle_bf.item()
+                    loss += loss_cycle_bf * cycle_scale
+
                 else:
                     # Original path
                     for rep in range(3):
@@ -862,6 +991,17 @@ for epoch in progress_bar:
                 "test/loss_prior": test_loss_prior_total / (test_i + 1),
                 "train/loss_fmri_recon": loss_fmri_recon_total / (train_i + 1),
                 "test/loss_fmri_recon": test_loss_fmri_recon_total / (test_i + 1),
+
+                # ADD THESE:
+                "train/loss_kl": loss_kl_total / (train_i + 1),
+                "train/loss_align": loss_align_total / (train_i + 1),
+                "test/loss_kl": test_loss_kl_total / (test_i + 1),
+                "test/loss_align": test_loss_align_total / (test_i + 1),
+                "train/loss_cycle_fb": loss_cycle_fb_total / (train_i + 1),
+                "train/loss_cycle_bf": loss_cycle_bf_total / (train_i + 1),
+                "test/loss_cycle_fb": test_loss_cycle_fb_total / (test_i + 1),
+                "test/loss_cycle_bf": test_loss_cycle_bf_total / (test_i + 1),
+                "test/voxel_correlation": test_voxel_corr_total / (test_i + 1),
             }
 
             if (epoch == num_epochs - 1) or (epoch % ckpt_interval == 0):

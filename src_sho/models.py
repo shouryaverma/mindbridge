@@ -818,101 +818,140 @@ class GNet8_Encoder():
 
         return torch.from_numpy(gnet8j_image_pred[self.subject])
 
-class ImageToFMRIMapper(nn.Module):
-    def __init__(self, clip_dim=1664, clip_tokens=256, hidden_dim=4096, 
+class SynBrainMapper(nn.Module):
+    def __init__(self, clip_dim=1664, clip_tokens=256, latent_dim=4096, 
                  num_subjects=1, voxel_sizes=None):
-                #  voxel_clamp_min=-5.0, voxel_clamp_max=5.0):
         super().__init__()
-
-        # # Store clamping values
-        # self.voxel_clamp_min = voxel_clamp_min
-        # self.voxel_clamp_max = voxel_clamp_max
         
-        self.clip_processor = nn.Sequential(
-            nn.LayerNorm(clip_dim),
-            nn.Linear(clip_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
-        
-        self.token_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim, 
-            num_heads=16, 
-            batch_first=True
-        )
-        
-        self.fmri_projector = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
+        self.clip_dim = clip_dim
+        self.clip_tokens = clip_tokens
+        self.latent_dim = latent_dim
         
         if voxel_sizes is None:
             voxel_sizes = [15000] * num_subjects
+        self.voxel_sizes = voxel_sizes
         
-        self.output_heads = nn.ModuleList([
-            nn.Linear(hidden_dim * 2, voxel_sizes[i]) 
-            for i in range(num_subjects)
+        # Positional encoding for transformer
+        self.pos_encoding = nn.Parameter(
+            self.create_sinusoidal_embeddings(clip_tokens, clip_dim), 
+            requires_grad=False
+        )
+        
+        # S2N Transformer: CLIP → fMRI Latent Distribution
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=clip_dim,
+            nhead=13,
+            dim_feedforward=clip_dim * 4,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.s2n_transformer = nn.TransformerEncoder(encoder_layer, num_layers=8)
+        
+        # Pre-projector for Mean
+        self.to_mu = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.GELU(),
+            nn.Linear(clip_dim, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, clip_dim)
+        )
+        
+        # Pre-projector for Log-Variance
+        self.to_logvar = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.GELU(),
+            nn.Linear(clip_dim, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, clip_dim)
+        )
+        
+        # Post-projector (after sampling)
+        self.post_projector = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.GELU(),
+            nn.Linear(clip_dim, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, latent_dim)
+        )
+        
+        # Subject-specific decoders
+        self.decoders = nn.ModuleList([
+            self.build_decoder(voxel_sizes[i]) for i in range(num_subjects)
         ])
-
-        # ==========================================
-        # Better Weight Initialization
-        # ==========================================
-        self._initialize_weights()
     
-    def forward(self, clip_tokens, subj_idx):
-        # Add input validation
-        assert not torch.isnan(clip_tokens).any(), "clip_tokens has NaN"
-        assert not torch.isinf(clip_tokens).any(), "clip_tokens has Inf"
-
-        h = self.clip_processor(clip_tokens)
-
-        # Check for explosions after processor
-        if torch.isnan(h).any() or torch.isinf(h).any():
-            print(f"NaN/Inf after clip_processor! Input stats: min={clip_tokens.min()}, max={clip_tokens.max()}")
-            h = torch.nan_to_num(h, nan=0.0, posinf=1e6, neginf=-1e6)
-
-        h_attended, _ = self.token_attention(h, h, h)
-
-        # Check after attention
-        if torch.isnan(h_attended).any() or torch.isinf(h_attended).any():
-            print(f"NaN/Inf after attention!")
-            h_attended = torch.nan_to_num(h_attended, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        h_pooled = h_attended.mean(dim=1)
-        h_fmri = self.fmri_projector(h_pooled)
-        
-        # Check before final projection
-        if torch.isnan(h_fmri).any() or torch.isinf(h_fmri).any():
-            print(f"NaN/Inf in h_fmri before output head!")
-            h_fmri = torch.nan_to_num(h_fmri, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        voxels_pred = self.output_heads[subj_idx](h_fmri)
-
-        # # Dynamically clamp outputs to reasonable range
-        # voxels_pred = torch.clamp(voxels_pred, 
-        #                            min=self.voxel_clamp_min, 
-        #                            max=self.voxel_clamp_max)
-        return voxels_pred
+    def create_sinusoidal_embeddings(self, num_positions, embedding_dim):
+        position = torch.arange(num_positions).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embedding_dim, 2) * 
+                            (-np.log(10000.0) / embedding_dim))
+        embeddings = torch.zeros(num_positions, embedding_dim)
+        embeddings[:, 0::2] = torch.sin(position * div_term)
+        embeddings[:, 1::2] = torch.cos(position * div_term)
+        return embeddings.unsqueeze(0)
     
-    def _initialize_weights(self):
-        """Initialize weights with smaller variance to prevent explosions"""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                # Use Xavier initialization with small gain
-                nn.init.xavier_normal_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.constant_(module.weight, 1.0)
-                nn.init.constant_(module.bias, 0.0)
+    def build_decoder(self, voxel_size):
+        return nn.Sequential(
+            # Per-token processing
+            Rearrange('b n d -> b d n'),  # (batch, 4096, 256)
+            nn.Conv1d(self.latent_dim, 2048, kernel_size=3, padding=1),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Conv1d(2048, 1024, kernel_size=3, padding=1),
+            nn.BatchNorm1d(1024),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),  # (batch, 1024, 1)
+            nn.Flatten(),  # (batch, 1024)
+            nn.Linear(1024, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
+            nn.Linear(2048, voxel_size)
+        )
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def forward(self, clip_tokens, subj_idx, return_distribution=False, deterministic=False):
+        batch_size = clip_tokens.shape[0]
         
-        # Extra small initialization for output heads (they're large)
-        for head in self.output_heads:
-            nn.init.xavier_normal_(head.weight, gain=0.05)  # Very small!
-            if head.bias is not None:
-                nn.init.constant_(head.bias, 0.0)
+        # Add positional encoding
+        h = clip_tokens + self.pos_encoding
+        
+        # S2N Transformer
+        h = self.s2n_transformer(h)
+        
+        # Predict distribution parameters
+        mu = self.to_mu(h)
+        logvar = self.to_logvar(h)
+        
+        # Sample from distribution OR use mean directly
+        if deterministic or not self.training:
+            z = mu  # Use mean directly for deterministic inference
+        else:
+            z = self.reparameterize(mu, logvar)
+        
+        # Post-projection
+        h_prime = self.post_projector(z)
+        
+        # Flatten and decode to voxels
+        voxels = self.decoders[subj_idx](h_prime)
+        
+        if return_distribution:
+            return voxels, mu, logvar, z
+        return voxels
 
 class RectifiedFlow(nn.Module):
     def __init__(
